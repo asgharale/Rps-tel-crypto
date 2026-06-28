@@ -1,64 +1,123 @@
 from django.contrib import admin
 from django.utils.safestring import mark_safe
-from .models import BotUser, WithdrawalRequest, CardNumber, DepositRequest, CryptoDepositRequest
+from .models import (
+    BotUser, GameMatch, FriendRequest, Friendship,
+    WithdrawalRequest, DepositRequest, CryptoDepositRequest, Report,
+)
 
 
 @admin.register(BotUser)
 class BotUserAdmin(admin.ModelAdmin):
-    list_display = ('chat_id', 'username', 'balance', 'wins', 'losses', 'created_at')
-    search_fields = ('chat_id', 'username')
+    list_display = ('chat_id', 'full_name', 'username', 'age', 'balance_display', 'wins', 'losses', 'is_banned', 'created_at')
+    search_fields = ('chat_id', 'username', 'full_name', 'tron_wallet')
+    list_filter = ('is_banned', 'profile_complete')
+    readonly_fields = ('created_at',)
+
+    def balance_display(self, obj):
+        return f"${obj.balance_cents/100:.2f}"
+    balance_display.short_description = "موجودی"
+
+
+@admin.register(GameMatch)
+class GameMatchAdmin(admin.ModelAdmin):
+    list_display = ('id', 'game_type', 'player1', 'player2', 'bet_display', 'status', 'is_offline', 'created_at')
+    list_filter = ('game_type', 'status', 'is_offline')
+
+    def bet_display(self, obj):
+        return f"${obj.bet_cents/100:.2f}"
+    bet_display.short_description = "شرط"
+
+
+@admin.register(FriendRequest)
+class FriendRequestAdmin(admin.ModelAdmin):
+    list_display = ('sender', 'receiver', 'status', 'created_at')
+    list_filter = ('status',)
+
+
+@admin.register(Friendship)
+class FriendshipAdmin(admin.ModelAdmin):
+    list_display = ('user1', 'user2', 'created_at')
 
 
 @admin.register(WithdrawalRequest)
 class WithdrawalAdmin(admin.ModelAdmin):
-    list_display = ('user', 'amount', 'card_number', 'status', 'created_at')
+    list_display = ('id', 'user', 'amount_display', 'tron_wallet', 'status', 'created_at')
     list_filter = ('status',)
-    actions = ['mark_as_paid']
+    actions = ['mark_as_paid', 'mark_as_rejected']
+
+    def amount_display(self, obj):
+        return f"${obj.amount_cents/100:.2f}"
+    amount_display.short_description = "مبلغ"
 
     def mark_as_paid(self, request, queryset):
-        queryset.update(status='paid')
-    mark_as_paid.short_description = "تغییر وضعیت به 'پرداخت شده'"
+        for obj in queryset.filter(status='pending'):
+            obj.status = 'paid'
+            obj.save()
+    mark_as_paid.short_description = "تغییر به پرداخت‌شده"
 
-
-@admin.register(CardNumber)
-class CardNumberAdmin(admin.ModelAdmin):
-    list_display = ('owner_name', 'number', 'is_active')
+    def mark_as_rejected(self, request, queryset):
+        for obj in queryset.filter(status='pending'):
+            obj.status = 'rejected'
+            obj.save()
+    mark_as_rejected.short_description = "رد کردن"
 
 
 @admin.register(DepositRequest)
 class DepositRequestAdmin(admin.ModelAdmin):
-    list_display = ('user', 'amount', 'status', 'receipt_preview_display', 'created_at')
-    list_filter = ('status', 'created_at')
-    readonly_fields = ('receipt_preview_display',)
+    list_display = ('id', 'user', 'amount_display', 'status', 'receipt_thumb', 'created_at')
+    list_filter = ('status',)
     list_editable = ('status',)
+    readonly_fields = ('receipt_thumb',)
 
-    def receipt_preview_display(self, obj):
+    def amount_display(self, obj):
+        return f"${obj.amount_cents/100:.2f}"
+    amount_display.short_description = "مبلغ"
+
+    def receipt_thumb(self, obj):
         if obj.receipt_image:
             return mark_safe(
                 f'<a href="{obj.receipt_image.url}" target="_blank">'
-                f'<img src="{obj.receipt_image.url}" width="150" style="border-radius:5px"/>'
-                f'</a>'
+                f'<img src="{obj.receipt_image.url}" width="100"/></a>'
             )
-        return "بدون تصویر"
-    receipt_preview_display.short_description = "پیش‌نمایش رسید"
+        return "—"
+    receipt_thumb.short_description = "رسید"
 
 
 @admin.register(CryptoDepositRequest)
-class CryptoDepositRequestAdmin(admin.ModelAdmin):
-    list_display = ('id', 'user', 'coin', 'amount', 'proof_type', 'status', 'created_at', 'reviewed_at')
+class CryptoDepositAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user', 'coin', 'amount_display', 'proof_type', 'status', 'created_at')
     list_filter = ('status', 'coin', 'proof_type')
-    readonly_fields = ('user', 'coin', 'amount', 'proof_type', 'proof_data', 'created_at')
+    readonly_fields = ('user', 'coin', 'amount_cents', 'proof_type', 'proof_data', 'created_at')
     list_editable = ('status',)
-    ordering = ('-created_at',)
+
+    def amount_display(self, obj):
+        return f"${obj.amount_cents/100:.2f}"
+    amount_display.short_description = "مبلغ"
 
     def save_model(self, request, obj, form, change):
-        """Auto credit/reject when status changes via Django admin."""
         if change:
             old = CryptoDepositRequest.objects.get(pk=obj.pk)
             if old.status == 'pending' and obj.status == 'verified':
-                obj.approve()
-                return
+                obj.approve(); return
             elif old.status == 'pending' and obj.status == 'rejected':
-                obj.reject()
-                return
+                obj.reject(); return
         super().save_model(request, obj, form, change)
+
+
+@admin.register(Report)
+class ReportAdmin(admin.ModelAdmin):
+    list_display = ('id', 'reporter', 'reported', 'status', 'created_at')
+    list_filter = ('status',)
+    actions = ['ignore_reports', 'ban_reported']
+
+    def ignore_reports(self, request, queryset):
+        queryset.update(status='ignored')
+    ignore_reports.short_description = "نادیده گرفتن"
+
+    def ban_reported(self, request, queryset):
+        for rep in queryset.filter(status='pending'):
+            rep.reported.is_banned = True
+            rep.reported.save(update_fields=['is_banned'])
+            rep.status = 'banned'
+            rep.save()
+    ban_reported.short_description = "مسدود کردن"

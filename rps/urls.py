@@ -1,6 +1,7 @@
+# rps/urls.py
 from django.urls import path
-from .views import handle_bot_request
+from .views import tg_webhook
 
 urlpatterns = [
-    path('webhook/', handle_bot_request),
+    path('webhook/', tg_webhook),
 ]
