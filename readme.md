@@ -20,7 +20,7 @@ rps_project/           ← Django project root
 │   ├── apps.py
 │   └── urls.py        ← Use urls_app.py (rename)
 ├── media/
-├── staticfiles/
+├── staticfiles/    
 ├── .env               ← Copy from .env.example and fill in
 └── manage.py
 ```

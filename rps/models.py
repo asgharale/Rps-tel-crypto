@@ -161,7 +161,11 @@ class Friendship(models.Model):
 # ─── Game Matches ─────────────────────────────────────────────────────────────
 
 class GameMatch(models.Model):
-    GAME_CHOICES = [('rps', 'سنگ کاغذ قیچی'), ('ttt', 'دوز')]
+    GAME_CHOICES = [
+        ('rps', 'سنگ کاغذ قیچی'),
+        ('ttt', 'دوز'),
+        ('c4f', 'چهار در یک'),
+    ]
     STATUS_CHOICES = [
         ('searching', 'جستجو'),
         ('active',    'در حال بازی'),
@@ -175,17 +179,22 @@ class GameMatch(models.Model):
     is_offline = models.BooleanField(default=False)   # vs bot
 
     # Bet in cents ($0 for offline)
-    bet_cents      = models.IntegerField(default=0)
-    search_fee_cents = models.IntegerField(default=0)  # fee paid to search ($0.20 for RPS, $0.30 for TTT)
+    bet_cents        = models.IntegerField(default=0)
+    search_fee_cents = models.IntegerField(default=0)  # fee paid to search
 
     # RPS moves
     p1_move = models.CharField(max_length=20, null=True, blank=True)
     p2_move = models.CharField(max_length=20, null=True, blank=True)
 
     # Tic-Tac-Toe board: 9-char string, '.' = empty, 'X' = p1, 'O' = p2
-    ttt_board      = models.CharField(max_length=9, default='.' * 9)
-    ttt_turn       = models.SmallIntegerField(default=1)   # 1 = p1, 2 = p2
-    ttt_winner     = models.SmallIntegerField(null=True, blank=True)  # 1, 2, or 0 for draw
+    ttt_board  = models.CharField(max_length=9, default='.' * 9)
+    ttt_turn   = models.SmallIntegerField(default=1)   # 1 = p1, 2 = p2
+    ttt_winner = models.SmallIntegerField(null=True, blank=True)
+
+    # Connect Four board: 42-char string (6 rows × 7 cols), row 0 = bottom
+    # '.' = empty, 'R' = p1 (🔴), 'Y' = p2 (🟡)
+    c4f_board  = models.CharField(max_length=42, default='.' * 42)
+    c4f_turn   = models.SmallIntegerField(default=1)   # 1 = p1, 2 = p2
 
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='searching')
 
@@ -229,6 +238,104 @@ class GameMatch(models.Model):
         if '.' not in b:
             return 'draw'
         return None
+
+    # ── Connect Four helpers ──────────────────────────────────────────────────
+
+    def c4f_get_board(self):
+        """Return board as list[42]. Index = row*7+col, row 0 = bottom."""
+        return list(self.c4f_board)
+
+    def c4f_drop(self, col: int, symbol: str) -> int:
+        """
+        Drop symbol into column (0-6).
+        Returns the row it landed on, or -1 if column is full.
+        """
+        board = list(self.c4f_board)
+        for row in range(6):          # row 0 = bottom, row 5 = top
+            idx = row * 7 + col
+            if board[idx] == '.':
+                board[idx] = symbol
+                self.c4f_board = ''.join(board)
+                return row
+        return -1                     # column full
+
+    def c4f_check_winner(self) -> str | None:
+        """Returns 'R', 'Y', 'draw', or None."""
+        b = self.c4f_board
+        # Check all 4-in-a-row directions
+        for row in range(6):
+            for col in range(7):
+                s = b[row * 7 + col]
+                if s == '.':
+                    continue
+                # Horizontal →
+                if col + 3 < 7:
+                    if all(b[row * 7 + col + k] == s for k in range(4)):
+                        return s
+                # Vertical ↑
+                if row + 3 < 6:
+                    if all(b[(row + k) * 7 + col] == s for k in range(4)):
+                        return s
+                # Diagonal ↗
+                if row + 3 < 6 and col + 3 < 7:
+                    if all(b[(row + k) * 7 + col + k] == s for k in range(4)):
+                        return s
+                # Diagonal ↖
+                if row + 3 < 6 and col - 3 >= 0:
+                    if all(b[(row + k) * 7 + col - k] == s for k in range(4)):
+                        return s
+        if '.' not in b:
+            return 'draw'
+        return None
+
+    def c4f_bot_move(self) -> int:
+        """
+        Heuristic bot: blocks opponent wins, takes its own wins, else centre-biased random.
+        Returns column index (0-6).
+        """
+        board = list(self.c4f_board)
+
+        def can_drop(b, col):
+            return b[col] == '.'      # top cell empty = column not full (row 5)
+
+        def drop_sim(b, col, sym):
+            nb = b[:]
+            for row in range(6):
+                if nb[row * 7 + col] == '.':
+                    nb[row * 7 + col] = sym
+                    return nb
+            return None
+
+        def wins(b, sym):
+            for r in range(6):
+                for c in range(7):
+                    s = b[r * 7 + c]
+                    if s != sym: continue
+                    if c+3<7 and all(b[r*7+c+k]==sym for k in range(4)): return True
+                    if r+3<6 and all(b[(r+k)*7+c]==sym for k in range(4)): return True
+                    if r+3<6 and c+3<7 and all(b[(r+k)*7+c+k]==sym for k in range(4)): return True
+                    if r+3<6 and c-3>=0 and all(b[(r+k)*7+c-k]==sym for k in range(4)): return True
+            return False
+
+        top_row = [board[5 * 7 + c] for c in range(7)]
+        valid = [c for c in range(7) if top_row[c] == '.']
+
+        # 1. Win immediately
+        for c in valid:
+            nb = drop_sim(board, c, 'Y')
+            if nb and wins(nb, 'Y'):
+                return c
+        # 2. Block opponent win
+        for c in valid:
+            nb = drop_sim(board, c, 'R')
+            if nb and wins(nb, 'R'):
+                return c
+        # 3. Prefer centre columns
+        preferred = [3, 2, 4, 1, 5, 0, 6]
+        for c in preferred:
+            if c in valid:
+                return c
+        return valid[0]
 
     def ttt_bot_move(self):
         """Simple minimax bot move. Returns chosen position."""

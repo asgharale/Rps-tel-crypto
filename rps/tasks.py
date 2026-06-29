@@ -91,7 +91,8 @@ def search_animation_task(match_id: int, tick: int = 0):
     secs = elapsed_secs % 60
     time_str = f"{mins}:{secs:02d}"
 
-    game_name = "سنگ کاغذ قیچی" if match.game_type == 'rps' else "دوز"
+    names = {'rps': 'سنگ کاغذ قیچی', 'ttt': 'دوز', 'c4f': 'چهار در یک'}
+    game_name = names.get(match.game_type, match.game_type)
     bet_str = f"${match.bet_cents/100:.2f}" if match.bet_cents else "آفلاین"
 
     text = (
@@ -163,4 +164,4 @@ def expire_search_task(match_id: int):
 def _is_admin(chat_id):
     import os
     admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-    return chat_id in admin_ids
+    return chat_id in admin_idsSS

@@ -54,6 +54,10 @@ def handle_callback(callback: dict) -> HttpResponse:
     msg_id  = message.get("message_id")
     chat_id = message.get("chat", {}).get("id")
 
+    # ── Connect Four move ─────────────────────────────────────────────────────
+    if data.startswith("c4f_"):
+        return _handle_c4f_callback(cb_id, from_id, data)
+
     # ── Tic-Tac-Toe move ──────────────────────────────────────────────────────
     if data.startswith("ttt_"):
         return _handle_ttt_callback(cb_id, from_id, data)
@@ -91,6 +95,49 @@ def _require_admin(cb_id, from_id) -> bool:
         answer_callback_direct(cb_id, "⛔ دسترسی ندارید.", show_alert=True)
         return False
     return True
+
+
+def _handle_c4f_callback(cb_id, from_id, data):
+    from rps.models import GameMatch, BotUser
+    from rps.logic import handle_c4f_move
+
+    parts = data.split("_")
+    # format: c4f_{match_id}_{col}  OR  c4f_{match_id}_full
+    if len(parts) != 3:
+        answer_callback_direct(cb_id, "خطا", show_alert=True)
+        return HttpResponse(status=200)
+
+    match_id = int(parts[1])
+    col_str  = parts[2]
+
+    if col_str == 'full':
+        answer_callback_direct(cb_id, "🚫 این ستون پر است!", show_alert=False)
+        return HttpResponse(status=200)
+
+    col = int(col_str)
+    if not (0 <= col <= 6):
+        answer_callback_direct(cb_id, "⚠️ ستون نامعتبر", show_alert=True)
+        return HttpResponse(status=200)
+
+    try:
+        match  = GameMatch.objects.select_related('player1', 'player2').get(pk=match_id)
+        player = BotUser.objects.get(chat_id=from_id)
+    except (GameMatch.DoesNotExist, BotUser.DoesNotExist):
+        answer_callback_direct(cb_id, "❌ بازی یافت نشد.", show_alert=True)
+        return HttpResponse(status=200)
+
+    result = handle_c4f_move(match, player, col)
+
+    if result == 'not_your_turn':
+        answer_callback_direct(cb_id, "⏳ نوبت شما نیست!", show_alert=False)
+    elif result == 'col_full':
+        answer_callback_direct(cb_id, "🚫 این ستون پر است!", show_alert=False)
+    elif result == 'already_done':
+        answer_callback_direct(cb_id, "✅ بازی تمام شده است.", show_alert=False)
+    else:
+        answer_callback_direct(cb_id, "✅")
+
+    return HttpResponse(status=200)
 
 
 # ── TTT callback ──────────────────────────────────────────────────────────────
@@ -324,7 +371,8 @@ def _handle_game_invite(cb_id, from_id, data):
 
     if action == "accept":
         # Deduct search fee + bet from invitee
-        fee = 20 if match.game_type == 'rps' else 30  # cents
+        fees = {'rps': 20, 'ttt': 30, 'c4f': 30}  # cents
+        fee = fees.get(match.game_type, 20)
         total = fee + match.bet_cents
         if invitee.balance_cents < total:
             answer_callback_direct(cb_id, f"❌ موجودی کافی ندارید ({_fmt(total)} لازم است).", show_alert=True)

@@ -11,6 +11,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot")
 def main_menu(is_admin=False):
     rows = [
         [{"text": "🎯 دوز (Tic-Tac-Toe)"}, {"text": "✊ سنگ کاغذ قیچی"}],
+        [{"text": "🔴 چهار در یک (Connect Four)"}],
         [{"text": "⚔️ بازی جنگ (به زودی)"}],
         [{"text": "👤 پروفایل من"}, {"text": "👥 دوستان"}],
         [{"text": "💰 کیف پول"}],
@@ -43,11 +44,47 @@ def cancel_search_kb():
 def rps_bet_kb(game='rps'):
     if game == 'rps':
         bets = ["0.30$", "0.50$", "1.00$", "2.00$", "5.00$"]
-    else:
+    elif game == 'ttt':
         bets = ["0.50$", "0.70$", "1.00$", "1.50$", "2.00$"]
+    else:  # c4f
+        bets = ["0.50$", "1.00$", "2.00$", "3.00$", "5.00$"]
     rows = [[{"text": f"💰 {b}"}] for b in bets]
     rows.append([{"text": "🔙 بازگشت"}])
     return {"keyboard": rows, "resize_keyboard": True}
+
+
+def c4f_board_kb(board: str, match_id: int):
+    """
+    board: 42-char string, row 0 = bottom, row 5 = top.
+    Renders 6 rows top→bottom with a drop-arrow row on top.
+    Tapping a column arrow drops into that column.
+    """
+    cell = {'.': '⬜', 'R': '🔴', 'Y': '🟡'}
+    rows = []
+
+    # Arrow row: one button per column to drop a piece
+    arrow_row = []
+    for col in range(7):
+        # Check if column is full (top row = row 5)
+        top_idx = 5 * 7 + col
+        if board[top_idx] != '.':
+            arrow_row.append({"text": "🚫", "callback_data": f"c4f_{match_id}_full"})
+        else:
+            arrow_row.append({"text": f"⬇️", "callback_data": f"c4f_{match_id}_{col}"})
+    rows.append(arrow_row)
+
+    # Board rows top→bottom (row 5 first visually)
+    for row in range(5, -1, -1):
+        r = []
+        for col in range(7):
+            idx = row * 7 + col
+            r.append({
+                "text": cell[board[idx]],
+                "callback_data": f"c4f_{match_id}_{col}",  # clicking cell = drop in that col
+            })
+        rows.append(r)
+
+    return {"inline_keyboard": rows}
 
 
 def rps_move_kb():
