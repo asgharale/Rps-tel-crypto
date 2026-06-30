@@ -76,10 +76,8 @@ ADMIN_IDS              = os.getenv("ADMIN_IDS", "8093967783")
 BOT_USERNAME           = os.getenv("BOT_USERNAME", "")
 
 # Crypto wallet addresses
+# Crypto wallet address (TRON / USDT-TRC20 only)
 WALLET_USDT_TRC20 = os.getenv("WALLET_USDT_TRC20", "")
-WALLET_USDT_ERC20 = os.getenv("WALLET_USDT_ERC20", "")
-WALLET_BTC        = os.getenv("WALLET_BTC", "")
-WALLET_ETH        = os.getenv("WALLET_ETH", "")
 
 # ─── Celery / Redis ────────────────────────────────────────────────────────────
 _redis = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")

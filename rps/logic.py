@@ -69,13 +69,12 @@ GAME_INVITE_FEE  = 20   # $0.20
 MIN_WITHDRAWAL   = 1500  # $15.00
 
 REFERRAL_BONUS   = 50    # $0.50 on join (if inviter exists; full bonus on profile complete)
+SIGNUP_BONUS     = 50    # $0.50 given to every new user immediately on /start
 
 # Crypto wallets
+# Only TRON (USDT-TRC20) is accepted for deposits.
 CRYPTO_WALLETS = {
-    "USDT (TRC20)": os.getenv("WALLET_USDT_TRC20", "TYourTRC20AddressHere"),
-    "USDT (ERC20)": os.getenv("WALLET_USDT_ERC20", "0xYourERC20AddressHere"),
-    "BTC":          os.getenv("WALLET_BTC",         "bc1YourBTCAddressHere"),
-    "ETH":          os.getenv("WALLET_ETH",         "0xYourETHAddressHere"),
+    "USDT (TRC20)": os.getenv("WALLET_USDT_TRC20", "TSEfwvtG48EoAXkP7HnbYsCxm7AtQXhUSu"),
 }
 
 
@@ -129,6 +128,10 @@ def handle_bot_logic(chat_id: int, text: str, photo_id=None, current_username=No
     if user.is_banned:
         send_message(chat_id, "🚫 حساب شما مسدود شده است.")
         return
+
+    # ── Signup bonus: $0.50 the moment a user is created ───────────────────────
+    if created:
+        user.add_dollars(SIGNUP_BONUS / 100)
 
     # Update username silently
     if current_username and user.username != current_username:
@@ -339,6 +342,7 @@ def _registration_flow(chat_id, user, text, mk):
         send_message(
             chat_id,
             "👋 *خوش آمدید!*\n\n"
+            f"🎁 *{_fmt(SIGNUP_BONUS)}* هدیه خوش‌آمدگویی به کیف پول شما اضافه شد!\n\n"
             "برای شروع، لطفاً *نام کامل* خود را وارد کنید:"
         )
         return True
@@ -360,13 +364,17 @@ def _registration_flow(chat_id, user, text, mk):
         user.age = int(text.strip())
         user.status = 'idle'
         user.save(update_fields=['age', 'status'])
-        user.check_and_grant_profile_bonus()
+        bonus_given = user.check_and_grant_profile_bonus()
+        bonus_line = (
+            f"💵 پاداش تکمیل پروفایل: *{_fmt(50)}* به کیف پول شما اضافه شد!\n\n"
+            if bonus_given else "\n"
+        )
         send_message(
             chat_id,
             f"🎉 *ثبت‌نام کامل شد!*\n\n"
             f"👤 نام: *{user.full_name}*\n"
             f"🎂 سن: *{user.age}*\n"
-            f"💵 پاداش ثبت‌نام: *{_fmt(50)}* به کیف پول شما اضافه شد!\n\n"
+            f"{bonus_line}"
             "با دکمه‌های زیر به بازی بپردازید 👇",
             mk,
         )
@@ -676,13 +684,20 @@ def _notify_admin_withdrawal(req: WithdrawalRequest):
 # ─── Crypto deposit ───────────────────────────────────────────────────────────
 
 def _start_crypto_deposit(chat_id, user):
-    coin_kb = {
-        "keyboard": [[{"text": c}] for c in CRYPTO_WALLETS] + [[{"text": "🔙 بازگشت"}]],
-        "resize_keyboard": True,
-    }
-    user.status = 'crypto_select_coin'
+    """Only one coin (USDT TRC20) is supported, so skip straight to the address."""
+    coin_name = next(iter(CRYPTO_WALLETS))
+    addr = CRYPTO_WALLETS[coin_name]
+    safe = coin_name.replace(" ", "_").replace("(", "").replace(")", "")
+    user.status = f'crypto_select_proof:{safe}'
     user.save(update_fields=['status'])
-    send_message(chat_id, "🪙 *واریز کریپتو*\n\nارز دیجیتال مورد نظر را انتخاب کنید:", coin_kb)
+    send_message(
+        chat_id,
+        f"🪙 *واریز کریپتو – {coin_name}*\n\n"
+        f"آدرس کیف پول (شبکه ترون / TRC20):\n`{addr}`\n\n"
+        "⚠️ فقط از شبکه *TRC20* استفاده کنید، در غیر این صورت واریز شما از بین می‌رود.\n\n"
+        "پس از واریز، مدرک پرداخت را ارسال کنید:",
+        crypto_proof_kb(),
+    )
 
 
 def _handle_crypto_flow(chat_id, user, text, photo_id, mk):
@@ -690,20 +705,6 @@ def _handle_crypto_flow(chat_id, user, text, photo_id, mk):
 
     if text == "🔙 بازگشت":
         _reset_user(user); return _wallet_menu(chat_id, user)
-
-    if status == 'crypto_select_coin':
-        if text not in CRYPTO_WALLETS:
-            return
-        addr = CRYPTO_WALLETS[text]
-        safe = text.replace(" ", "_").replace("(", "").replace(")", "")
-        user.status = f'crypto_select_proof:{safe}'
-        user.save(update_fields=['status'])
-        return send_message(
-            chat_id,
-            f"🪙 *{text}*\n\nآدرس کیف پول:\n`{addr}`\n\n"
-            "پس از واریز، مدرک پرداخت را ارسال کنید:",
-            crypto_proof_kb(),
-        )
 
     if status.startswith('crypto_select_proof:'):
         coin_safe = status.split(':', 1)[1]
