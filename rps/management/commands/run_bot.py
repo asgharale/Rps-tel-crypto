@@ -1,3 +1,13 @@
+# NOTE (unused/legacy): the active bot no longer runs through this
+# long-polling management command. Message delivery now goes through the
+# Telegram webhook (rps/views.py → tg_webhook) and Celery
+# (rps/tasks.py → search_animation_task / expire_search_task /
+# broadcast_task), so 5-minute search expiry and level-based entry fees are
+# already handled there. This file also references fields that don't exist
+# on the current models (match.amount, user.balance instead of
+# entry_fee_cents / balance_cents) and predates the level/prize system —
+# keeping it only for reference. Safe to delete once confirmed unused.
+
 import time
 import random
 from django.core.management.base import BaseCommand

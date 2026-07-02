@@ -4,9 +4,16 @@ logic.py  –  Main bot FSM dispatcher.
 Design principles:
   - All state is stored in BotUser.status (string).
   - Money is in integer cents (avoid float).
-  - Celery is used for ALL outbound messages.
+  - Celery is used for ALL outbound messages that don't need a message_id back.
+  - Turn-based games (TTT / Connect Four / Minesweeper) are updated in-place
+    with editMessageText instead of sending a new message every turn.
   - Inline callbacks are routed through views.py → handle_callback().
-  - Games: RPS and Tic-Tac-Toe (TTT). War is placeholder.
+  - Games: RPS (best of 3), Tic-Tac-Toe, Connect Four, Minesweeper (solo).
+
+Money / fairness note:
+  There is NO betting or wagering anywhere in this bot. Every paid game has
+  a fixed, published entry fee and a fixed prize the winner receives — the
+  amounts never depend on what an opponent chooses to risk.
 """
 
 import os
@@ -14,25 +21,24 @@ import re
 import time
 import random
 import requests
-from django.db.models import Q
 from django.utils import timezone
 from django.core.files.base import ContentFile
-from datetime import timedelta
 
 from rps.models import (
-    BotUser, GameMatch, FriendRequest, Friendship,
+    BotUser, Province, GameMatch, FriendRequest, Friendship,
     WithdrawalRequest, DepositRequest, CryptoDepositRequest, Report,
+    BroadcastJob,
 )
 from rps.tg_api import send_message, send_message_direct, download_tg_file
 from rps.keyboards import (
     main_menu, back_kb, cancel_search_kb,
-    rps_bet_kb, rps_move_kb,
-    ttt_board_kb,
-    c4f_board_kb,
-    profile_menu_kb, wallet_menu_kb,
+    game_mode_kb, level_kb, LEVEL_BUTTON_LABELS,
+    rps_move_kb, ttt_board_kb, c4f_board_kb, ms_board_kb,
+    profile_menu_kb, province_kb, wallet_menu_kb,
     deposit_amount_kb, deposit_method_kb, crypto_proof_kb,
-    friends_menu_kb,
+    friends_menu_kb, friend_pick_kb,
     admin_report_inline_kb, admin_withdrawal_inline_kb, admin_deposit_inline_kb,
+    broadcast_cancel_kb,
     game_invite_inline_kb, friend_req_inline_kb,
 )
 
@@ -45,37 +51,59 @@ TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "8093967783")
 TELEGRAM_TOKEN         = os.getenv("TELEGRAM_TOKEN", "")
 BOT_USERNAME           = os.getenv("BOT_USERNAME", "your_bot")
 
-# Game fees & prizes (in cents)
-RPS_SEARCH_FEE   = 20   # $0.20 search fee
-TTT_SEARCH_FEE   = 30   # $0.30 search fee
-C4F_SEARCH_FEE   = 30   # $0.30 search fee
-
-RPS_OFFLINE_FEE  = 5    # $0.05 play fee
-TTT_OFFLINE_FEE  = 5    # $0.05 play fee
-C4F_OFFLINE_FEE  = 5    # $0.05 play fee
-
-RPS_OFFLINE_WIN  = 35   # $0.35 win reward (offline)
-TTT_OFFLINE_WIN  = 35   # $0.35 win reward (offline)
-C4F_OFFLINE_WIN  = 35   # $0.35 win reward (offline)
-
-# Available online bet amounts per game
-RPS_BET_OPTIONS  = [30, 50, 100, 200, 500]    # $0.30 $0.50 $1 $2 $5
-TTT_BET_OPTIONS  = [50, 70, 100, 150, 200]    # $0.50 $0.70 $1 $1.50 $2
-C4F_BET_OPTIONS  = [50, 100, 200, 300, 500]   # $0.50 $1 $2 $3 $5
-
-FRIEND_REQ_FEE   = 10   # $0.10
-GAME_INVITE_FEE  = 20   # $0.20
-
-MIN_WITHDRAWAL   = 1500  # $15.00
-
-REFERRAL_BONUS   = 50    # $0.50 on join (if inviter exists; full bonus on profile complete)
-SIGNUP_BONUS     = 50    # $0.50 given to every new user immediately on /start
-
-# Crypto wallets
-# Only TRON (USDT-TRC20) is accepted for deposits.
-CRYPTO_WALLETS = {
-    "USDT (TRC20)": os.getenv("WALLET_USDT_TRC20", "TSEfwvtG48EoAXkP7HnbYsCxm7AtQXhUSu"),
+# ── Fixed levels for every competitive game: entry fee → prize for the winner.
+# These numbers never change based on an opponent — there is no wagering.
+LEVELS = {
+    'intermediate': {'label': 'متوسط',   'entry': 30,  'prize': 50},
+    'master':       {'label': 'حرفه‌ای', 'entry': 60,  'prize': 100},
+    'gods':         {'label': 'خدایان',  'entry': 100, 'prize': 180},
 }
+LEVEL_ORDER = ['intermediate', 'master', 'gods']
+
+# Playing with a friend is intentionally cheap and simple: flat $0.10 entry
+# each, winner receives the combined $0.20 as a prize.
+FRIENDLY_ENTRY_FEE = 10   # $0.10
+FRIENDLY_PRIZE     = 20   # $0.20
+
+MIN_WITHDRAWAL  = 1000    # $10.00
+
+REFERRAL_BONUS  = 50      # $0.50 on join (if inviter exists; full bonus on profile complete)
+SIGNUP_BONUS    = 50      # $0.50 given to every new user immediately on /start
+
+GAME_NAMES = {
+    'rps': 'سنگ کاغذ قیچی',
+    'ttt': 'دوز',
+    'c4f': 'چهار در یک',
+    'ms':  'ماین‌یاب',
+}
+
+GAME_DESCRIPTIONS = {
+    'rps': (
+        "✊📄✂️ *سنگ کاغذ قیچی*\n\n"
+        "بازی سریع و کلاسیک! هر مسابقه *سه دور* دارد (Best of 3) — "
+        "هرکس زودتر ۲ دور را ببرد، برنده کل مسابقه است.\n"
+        "در صورت مساوی شدن یک دور، همان دور دوباره تکرار می‌شود."
+    ),
+    'ttt': (
+        "🎯 *دوز (Tic-Tac-Toe)*\n\n"
+        "روی جدول کلاسیک *۳ در ۳* به‌نوبت علامت می‌گذارید. "
+        "اولین کسی که سه‌تایی (افقی، عمودی یا مورب) بسازد برنده است."
+    ),
+    'c4f': (
+        "🔴 *چهار در یک (Connect Four)*\n\n"
+        "مهره‌های خود را در یکی از ۷ ستون رها می‌کنید. "
+        "اولین کسی که ۴ مهره پشت‌سرهم (افقی، عمودی یا مورب) بچیند برنده است."
+    ),
+    'ms': (
+        "💣 *ماین‌یاب (Minesweeper)*\n\n"
+        "یک بازی *تک‌نفره* کلاسیک؛ رقیب ندارید، فقط با تخته بازی می‌کنید! "
+        "خانه‌های امن را باز کنید بدون اینکه به مین بخورید. "
+        "اگر تمام خانه‌های امن را پیدا کنید، جایزه را می‌برید؛ "
+        "اگر به مین بخورید، فقط هزینه ورود را از دست می‌دهید."
+    ),
+}
+
+MS_MINES = 6  # constant difficulty on the 5×6 board
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -88,13 +116,8 @@ def _fmt(cents: int) -> str:
     return f"${cents/100:.2f}"
 
 
-def _cents_from_dollar_str(s: str):
-    """Parse '0.30$' or '$0.30' → 30 (cents). Returns None on failure."""
-    s = s.replace("$", "").replace(",", "").strip()
-    try:
-        return round(float(s) * 100)
-    except ValueError:
-        return None
+def _display_name(u: BotUser) -> str:
+    return u.full_name or u.username or str(u.chat_id)
 
 
 def _tg_admin_post(method: str, **kwargs):
@@ -107,6 +130,13 @@ def _tg_admin_post(method: str, **kwargs):
     except Exception as e:
         print(f"Admin Telegram API error ({method}): {e}")
         return None
+
+
+def _level_from_text(text: str):
+    for lvl, label in LEVEL_BUTTON_LABELS.items():
+        if text == label:
+            return lvl
+    return None
 
 
 # ─── Registration guard ───────────────────────────────────────────────────────
@@ -169,7 +199,7 @@ def handle_bot_logic(chat_id: int, text: str, photo_id=None, current_username=No
     # Withdrawal flow
     if status == 'wait_withdrawal_wallet':
         return _handle_withdrawal_wallet(chat_id, user, text, mk)
-    if status == 'wait_withdrawal_amount':
+    if status.startswith('wait_withdrawal_amount'):
         return _handle_withdrawal_amount(chat_id, user, text, mk)
 
     # Search for friend
@@ -180,7 +210,19 @@ def handle_bot_logic(chat_id: int, text: str, photo_id=None, current_username=No
     if status.startswith('report_reason_'):
         return _handle_report_reason(chat_id, user, text, status, mk)
 
-    # RPS move
+    # Game: description → mode choice (search online / bot / friends)
+    if status.startswith('gamechoice_'):
+        return _handle_game_mode(chat_id, user, text, mk)
+
+    # Game: level choice (entry fee → prize)
+    if status.startswith('levelpick_'):
+        return _handle_level_pick(chat_id, user, text, mk)
+
+    # Game: choosing a friend to invite
+    if status.startswith('friendpick_'):
+        return _handle_friend_pick(chat_id, user, text, mk)
+
+    # RPS move (reply-keyboard based)
     if status.startswith('playing_rps_'):
         return _handle_rps_move(chat_id, user, text, mk)
 
@@ -211,6 +253,9 @@ def handle_bot_logic(chat_id: int, text: str, photo_id=None, current_username=No
 
     if text == "🔴 چهار در یک (Connect Four)":
         return _game_menu(chat_id, user, 'c4f', mk)
+
+    if text == "💣 ماین‌یاب":
+        return _game_menu(chat_id, user, 'ms', mk)
 
     if text == "⚔️ بازی جنگ (به زودی)":
         return send_message(chat_id, "🚧 این بازی به زودی اضافه می‌شود! منتظر آپدیت باشید.", mk)
@@ -243,6 +288,11 @@ def handle_bot_logic(chat_id: int, text: str, photo_id=None, current_username=No
         user.status = 'edit_phone'; user.save(update_fields=['status'])
         return send_message(chat_id, "📱 شماره تلفن خود را وارد کنید:", back_kb())
 
+    if text == "🏙 ویرایش استان":
+        user.status = 'edit_province'; user.save(update_fields=['status'])
+        provinces = Province.objects.filter(is_active=True)
+        return send_message(chat_id, "🏙 استان خود را انتخاب کنید:", province_kb(provinces))
+
     if text == "💳 ویرایش کیف پول ترون":
         user.status = 'edit_tron'; user.save(update_fields=['status'])
         return send_message(chat_id, "💳 آدرس کیف پول ترون (TRC20) خود را وارد کنید:", back_kb())
@@ -271,20 +321,13 @@ def handle_bot_logic(chat_id: int, text: str, photo_id=None, current_username=No
     if text and "💵" in text and "$" in text:
         return _handle_deposit_amount_selected(chat_id, user, text, mk)
 
-    # RPS game bet selection
-    if text and "💰" in text and "$" in text and user.status.startswith('bet_'):
-        return _handle_bet_selected(chat_id, user, text, mk)
-
-    # RPS moves
-    if text in ("🪨 سنگ", "📄 کاغذ", "✂️ قیچی"):
-        return _handle_rps_move(chat_id, user, text, mk)
-
-    # Search cancel / offline
+    # Search cancel
     if text == "❌ انصراف از جستجو":
         return _cancel_search(chat_id, user, mk)
 
-    if text == "🤖 بازی آفلاین (با ربات)":
-        return _start_offline_game(chat_id, user, mk)
+    # RPS moves (fallback, normally caught by the 'playing_rps_' status prefix above)
+    if text in ("🪨 سنگ", "📄 کاغذ", "✂️ قیچی"):
+        return _handle_rps_move(chat_id, user, text, mk)
 
     # Friends sub-menu
     if text == "👥 لیست دوستان":
@@ -298,7 +341,12 @@ def handle_bot_logic(chat_id: int, text: str, photo_id=None, current_username=No
         return send_message(chat_id, "🔍 یوزرنیم یا chat_id دوستتان را وارد کنید:", back_kb())
 
     if text == "🎮 دعوت به بازی":
-        return _invite_friend_to_game(chat_id, user)
+        return send_message(
+            chat_id,
+            "🎮 برای دعوت یک دوست به بازی، ابتدا از منوی اصلی بازی مورد نظر را باز کنید "
+            "و گزینه‌ی «👥 بازی با دوستان» را انتخاب کنید.",
+            friends_menu_kb(),
+        )
 
     # Report
     if text == "🚨 گزارش کاربر":
@@ -408,6 +456,7 @@ def _show_profile(chat_id, user: BotUser):
     link = f"https://t.me/{BOT_USERNAME}?start={user.chat_id}"
     avatar_str = "✅ تنظیم شده" if user.avatar_file_id else "❌ تنظیم نشده"
     phone_str = user.phone or "تنظیم نشده"
+    province_str = user.province.name if (user.province and user.province.name) else "تنظیم نشده"
     tron_str = f"`{user.tron_wallet}`" if user.tron_wallet else "تنظیم نشده"
     msg = (
         "👤 *پروفایل شما*\n"
@@ -415,6 +464,7 @@ def _show_profile(chat_id, user: BotUser):
         f"📛 نام: *{user.full_name}*\n"
         f"🎂 سن: *{user.age}*\n"
         f"📱 شماره: {phone_str}\n"
+        f"🏙 استان: {province_str}\n"
         f"💳 کیف پول ترون: {tron_str}\n"
         f"🖼 آواتار: {avatar_str}\n"
         "─────────────\n"
@@ -466,6 +516,18 @@ def _handle_profile_edit(chat_id, user, text, photo_id, mk):
         user.save(update_fields=['phone', 'status'])
         return send_message(chat_id, "✅ شماره تلفن ثبت شد.", profile_menu_kb())
 
+    if status == 'edit_province':
+        if not text:
+            return send_message(chat_id, "⚠️ یک استان را از دکمه‌ها انتخاب کنید:")
+        province = Province.objects.filter(is_active=True, name=text.strip()).first()
+        if not province:
+            provinces = Province.objects.filter(is_active=True)
+            return send_message(chat_id, "⚠️ استان یافت نشد، از دکمه‌های زیر انتخاب کنید:", province_kb(provinces))
+        user.province = province
+        user.status = 'idle'
+        user.save(update_fields=['province', 'status'])
+        return send_message(chat_id, f"✅ استان به *{province.name}* تغییر یافت.", profile_menu_kb())
+
     if status == 'edit_tron':
         addr = text.strip() if text else ""
         if not addr or not re.match(r'^T[A-Za-z0-9]{33}$', addr):
@@ -512,8 +574,7 @@ def _wallet_menu(chat_id, user):
 
 
 def _handle_deposit_amount_selected(chat_id, user, text, mk):
-    """User tapped a $1/$5/$10/$20 button."""
-    # Extract dollar amount
+    """User tapped a $1/$5/$10/$20 button (card-payment path only)."""
     match = re.search(r'\$([\d]+)', text)
     if not match:
         return
@@ -522,13 +583,13 @@ def _handle_deposit_amount_selected(chat_id, user, text, mk):
     if dollars not in valid:
         return send_message(chat_id, "⚠️ مبلغ نامعتبر است.", mk)
     cents = dollars * 100
-    user.status = f'deposit_amount_{cents}'
+    user.status = f'deposit_receipt_{cents}'
     user.save(update_fields=['status'])
     send_message(
         chat_id,
-        f"💳 *شارژ {_fmt(cents)}*\n\n"
-        "برای واریز، روش پرداخت را انتخاب کنید:",
-        deposit_method_kb(),
+        f"💳 *واریز {_fmt(cents)} از طریق کارت*\n\n"
+        "لطفاً رسید پرداخت خود را به‌صورت عکس ارسال کنید:",
+        back_kb(),
     )
 
 
@@ -538,21 +599,6 @@ def _handle_deposit_flow(chat_id, user, text, photo_id, mk):
     if text == "🔙 بازگشت":
         _reset_user(user)
         return _wallet_menu(chat_id, user)
-
-    # User selected card payment method
-    if text == "💳 پرداخت کارتی (رسید)" and status.startswith('deposit_amount_'):
-        cents = int(status.split('_')[2])
-        user.status = f'deposit_receipt_{cents}'
-        user.save(update_fields=['status'])
-        return send_message(
-            chat_id,
-            f"💳 *واریز {_fmt(cents)} از طریق کارت*\n\n"
-            "لطفاً رسید پرداخت خود را به‌صورت عکس ارسال کنید:",
-            back_kb(),
-        )
-
-    if text == "🪙 واریز کریپتو" and status.startswith('deposit_amount_'):
-        return _start_crypto_deposit(chat_id, user)
 
     # Waiting for receipt photo
     if status.startswith('deposit_receipt_') and photo_id:
@@ -634,7 +680,7 @@ def _handle_withdrawal_wallet(chat_id, user, text, mk):
         f"💵 مبلغ برداشت را وارد کنید (دلار):\n"
         f"💰 موجودی: *{_fmt(user.balance_cents)}*\n"
         f"📌 حداقل: *{_fmt(MIN_WITHDRAWAL)}*\n\n"
-        "مثال: `15` یا `20`",
+        "مثال: `10` یا `20`",
         back_kb(),
     )
 
@@ -645,7 +691,7 @@ def _handle_withdrawal_amount(chat_id, user, text, mk):
     parts = user.status.split(':', 1)
     wallet = parts[1] if len(parts) > 1 else ''
     if not text or not text.strip().replace('.', '').isdigit():
-        return send_message(chat_id, "⚠️ یک عدد معتبر وارد کنید (مثل 15 یا 20):")
+        return send_message(chat_id, "⚠️ یک عدد معتبر وارد کنید (مثل 10 یا 20):")
     cents = round(float(text.strip()) * 100)
     if cents < MIN_WITHDRAWAL:
         return send_message(chat_id, f"⚠️ حداقل برداشت {_fmt(MIN_WITHDRAWAL)} است.")
@@ -683,6 +729,11 @@ def _notify_admin_withdrawal(req: WithdrawalRequest):
 
 # ─── Crypto deposit ───────────────────────────────────────────────────────────
 
+CRYPTO_WALLETS = {
+    "USDT (TRC20)": os.getenv("WALLET_USDT_TRC20", "TSEfwvtG48EoAXkP7HnbYsCxm7AtQXhUSu"),
+}
+
+
 def _start_crypto_deposit(chat_id, user):
     """Only one coin (USDT TRC20) is supported, so skip straight to the address."""
     coin_name = next(iter(CRYPTO_WALLETS))
@@ -719,188 +770,193 @@ def _handle_crypto_flow(chat_id, user, text, photo_id, mk):
 
     if status.startswith('crypto_wait_ss:') and photo_id:
         coin_safe = status.split(':', 1)[1]
-        user.status = f'crypto_got_ss_{photo_id}:{coin_safe}'
+        user.status = f'crypto_amount:{coin_safe}:screenshot:{photo_id}'
         user.save(update_fields=['status'])
         return send_message(chat_id, "✅ اسکرین‌شات دریافت شد.\n💵 مبلغ واریزی را به دلار وارد کنید (مثلاً: 10):")
 
-    if status.startswith('crypto_wait_tx:') and text:
+    if status.startswith('crypto_wait_ss:') and not photo_id:
+        return send_message(chat_id, "📸 تصویر اسکرین‌شات را ارسال کنید:", back_kb())
+
+    if status.startswith('crypto_wait_tx:'):
         coin_safe = status.split(':', 1)[1]
-        user.status = f'crypto_got_tx_{text}:{coin_safe}'
+        if not text or not text.strip():
+            return send_message(chat_id, "🔢 کد پیگیری یا TxHash را وارد کنید:", back_kb())
+        user.status = f'crypto_amount:{coin_safe}:tracking:{text.strip()[:200]}'
         user.save(update_fields=['status'])
         return send_message(chat_id, "✅ کد دریافت شد.\n💵 مبلغ واریزی را به دلار وارد کنید (مثلاً: 10):")
 
-    # Amount entry
-    if (status.startswith('crypto_got_ss_') or status.startswith('crypto_got_tx_')) and text:
-        if not text.strip().replace('.', '').isdigit():
+    if status.startswith('crypto_amount:'):
+        parts = status.split(':', 3)
+        _, coin_safe, proof_type, proof_data = parts
+        if not text or not text.strip().replace('.', '').isdigit():
             return send_message(chat_id, "⚠️ یک عدد معتبر وارد کنید:")
-        cents = round(float(text.strip()) * 100)
-        if cents < 100:
+        dollars = float(text.strip())
+        if dollars < 1:
             return send_message(chat_id, "⚠️ حداقل مبلغ ۱ دلار است.")
-
-        parts = status.rsplit(':', 1)
-        coin_safe = parts[1] if len(parts) > 1 else 'unknown'
-        coin_name = _resolve_coin(coin_safe)
-        data_part = parts[0]
-
-        if data_part.startswith('crypto_got_ss_'):
-            proof_type = 'screenshot'
-            proof_data = data_part.replace('crypto_got_ss_', '')
-        else:
-            proof_type = 'tracking'
-            proof_data = data_part.replace('crypto_got_tx_', '')
-
-        deposit = CryptoDepositRequest.objects.create(
+        cents = round(dollars * 100)
+        coin_name = coin_safe.replace("_", " ")
+        req = CryptoDepositRequest.objects.create(
             user=user, coin=coin_name,
             amount_cents=cents, proof_type=proof_type, proof_data=proof_data,
         )
         user.status = 'idle'
         user.save(update_fields=['status'])
-        _notify_admin_crypto(deposit)
-        send_message(
+        _notify_admin_crypto(req, photo_id=proof_data if proof_type == 'screenshot' else None)
+        return send_message(
             chat_id,
-            f"✅ *درخواست واریز کریپتو ثبت شد!*\n\n"
-            f"🪙 ارز: {coin_name}\n"
-            f"💵 مبلغ: *{_fmt(cents)}*\n"
-            f"🔖 شماره: `#{deposit.pk}`\n\n"
-            "پس از تایید ادمین، موجودی شما شارژ می‌شود.",
+            f"✅ *درخواست واریز ثبت شد!*\n\n"
+            f"💵 مبلغ: *{_fmt(req.amount_cents)}*\n"
+            f"🔖 شماره: `#{req.pk}`\n\n"
+            "پس از بررسی توسط ادمین، موجودی شما شارژ می‌شود.",
             mk,
         )
 
 
-def _resolve_coin(coin_safe: str) -> str:
-    for c in CRYPTO_WALLETS:
-        if c.replace(" ", "_").replace("(", "").replace(")", "") == coin_safe:
-            return c
-    return coin_safe.replace('_', ' ')
-
-
-def _notify_admin_crypto(deposit: CryptoDepositRequest):
-    user = deposit.user
-    uname = f"@{user.username}" if user.username else f"ID:{user.chat_id}"
+def _notify_admin_crypto(req: CryptoDepositRequest, photo_id=None):
+    from rps.keyboards import admin_deposit_inline_kb
     caption = (
-        f"💎 *درخواست واریز کریپتو* `#{deposit.pk}`\n\n"
-        f"👤 کاربر: {uname}\n"
-        f"📛 نام: {user.full_name}\n"
-        f"🆔 Chat ID: `{user.chat_id}`\n"
-        f"🪙 ارز: {deposit.coin}\n"
-        f"💵 مبلغ: *{_fmt(deposit.amount_cents)}*\n"
-        f"📋 نوع مدرک: {'📸 اسکرین‌شات' if deposit.proof_type == 'screenshot' else '🔢 کد پیگیری'}\n"
+        f"🪙 *درخواست واریز کریپتو* `#{req.pk}`\n\n"
+        f"👤 کاربر: `{req.user.chat_id}`\n"
+        f"📛 نام: {req.user.full_name}\n"
+        f"💵 مبلغ: *{_fmt(req.amount_cents)}*\n"
+        f"🧾 نوع مدرک: {req.get_proof_type_display()}\n"
     )
-    if deposit.proof_type == "tracking":
-        caption += f"🔢 کد: `{deposit.proof_data}`\n"
-    inline_kb = admin_deposit_inline_kb(deposit.pk, crypto=True)
-    if deposit.proof_type == "screenshot":
+    inline_kb = admin_deposit_inline_kb(req.pk, crypto=True)
+    if photo_id:
         from rps.tg_api import send_photo_direct
-        send_photo_direct(TELEGRAM_ADMIN_CHAT_ID, deposit.proof_data, caption=caption, reply_markup=inline_kb)
+        send_photo_direct(TELEGRAM_ADMIN_CHAT_ID, photo_id, caption=caption, reply_markup=inline_kb)
     else:
+        caption += f"🔢 کد: `{req.proof_data}`"
         from rps.tg_api import send_message_direct
         send_message_direct(TELEGRAM_ADMIN_CHAT_ID, caption, inline_kb)
 
 
-# ─── Games ───────────────────────────────────────────────────────────────────
+# ─── Games: description → mode → level ────────────────────────────────────────
 
 def _game_menu(chat_id, user, game_type, mk):
-    """Show bet selection for online play, or offline option."""
-    names = {'rps': 'سنگ کاغذ قیچی', 'ttt': 'دوز', 'c4f': 'چهار در یک'}
-    fees  = {'rps': RPS_SEARCH_FEE, 'ttt': TTT_SEARCH_FEE, 'c4f': C4F_SEARCH_FEE}
-    off_fees = {'rps': RPS_OFFLINE_FEE, 'ttt': TTT_OFFLINE_FEE, 'c4f': C4F_OFFLINE_FEE}
+    """Show the game's description, then either the 3-way mode choice
+    (search online / play with bot / play with friends) or — for the
+    solo Minesweeper game — go straight to level selection."""
+    desc = GAME_DESCRIPTIONS.get(game_type, "")
 
-    game_name   = names[game_type]
-    fee         = fees[game_type]
-    offline_fee = off_fees[game_type]
+    if game_type == 'ms':
+        user.status = 'levelpick_ms_solo'
+        user.save(update_fields=['status'])
+        return send_message(chat_id, desc + "\n\n🎚 یک سطح را انتخاب کنید 👇", level_kb())
 
-    msg = (
-        f"🎮 *{game_name}*\n\n"
-        f"🔵 *بازی آنلاین:*\n"
-        f"  هزینه جستجو: *{_fmt(fee)}*\n"
-        f"  مبلغ شرط: به انتخاب شما\n"
-        f"  برنده: مجموع دو شرط ➡ برنده\n\n"
-        f"⚪ *بازی آفلاین (با ربات):*\n"
-        f"  هزینه: *{_fmt(offline_fee)}*\n"
-        f"  جایزه برد: *{_fmt(C4F_OFFLINE_WIN)}*\n\n"
-        "مبلغ شرط آنلاین را انتخاب کنید (یا بازی با ربات):"
-    )
-    user.status = f'bet_{game_type}'
+    user.status = f'gamechoice_{game_type}'
     user.save(update_fields=['status'])
-    bet_kb = rps_bet_kb(game_type)
-    kb = {
-        "keyboard": [[{"text": "🤖 بازی آفلاین (با ربات)"}]] + bet_kb["keyboard"],
-        "resize_keyboard": True,
-    }
-    send_message(chat_id, msg, kb)
+    send_message(chat_id, desc + "\n\n🕹 چطور می‌خواهید بازی کنید؟", game_mode_kb())
 
 
-def _handle_bet_selected(chat_id, user, text, mk):
-    """User picked a bet amount like '💰 0.30$'."""
-    status = user.status
-    if not status.startswith('bet_'):
-        return
-    game_type = status.split('_')[1]  # 'rps', 'ttt', or 'c4f'
+def _handle_game_mode(chat_id, user, text, mk):
+    game_type = user.status.split('_', 1)[1]
 
-    cents = _cents_from_dollar_str(text.replace("💰", "").strip())
-    if cents is None:
-        return send_message(chat_id, "⚠️ مبلغ نامعتبر.")
+    if text == "🔙 بازگشت":
+        _reset_user(user)
+        return send_message(chat_id, _welcome_msg(user), mk)
 
-    valid_bets = {'rps': RPS_BET_OPTIONS, 'ttt': TTT_BET_OPTIONS, 'c4f': C4F_BET_OPTIONS}
-    if cents not in valid_bets.get(game_type, []):
-        return send_message(chat_id, "⚠️ این مبلغ معتبر نیست.")
+    if text == "🔎 جستجوی آنلاین":
+        user.status = f'levelpick_{game_type}_online'
+        user.save(update_fields=['status'])
+        return send_message(chat_id, "🎚 یک سطح را انتخاب کنید 👇", level_kb())
 
-    fees = {'rps': RPS_SEARCH_FEE, 'ttt': TTT_SEARCH_FEE, 'c4f': C4F_SEARCH_FEE}
-    fee = fees[game_type]
-    total_cost = fee + cents
+    if text == "🤖 بازی با ربات":
+        note = "\n\nℹ️ بازی دوز همیشه روی جدول کلاسیک ۳ در ۳ انجام می‌شود." if game_type == 'ttt' else ""
+        user.status = f'levelpick_{game_type}_bot'
+        user.save(update_fields=['status'])
+        return send_message(chat_id, "🎚 یک سطح را انتخاب کنید 👇" + note, level_kb())
 
-    if user.balance_cents < total_cost:
+    if text == "👥 بازی با دوستان":
+        friends = Friendship.get_friends(user)
+        if not friends:
+            _reset_user(user)
+            return send_message(chat_id, "👥 هنوز دوستی ندارید. ابتدا از منوی «دوستان» یک دوست اضافه کنید.", mk)
+        user.status = f'friendpick_{game_type}'
+        user.save(update_fields=['status'])
+        return send_message(
+            chat_id,
+            f"👥 دوست خود را برای بازی *{GAME_NAMES[game_type]}* انتخاب کنید.\n"
+            f"💵 هزینه ورود هرکدام: *{_fmt(FRIENDLY_ENTRY_FEE)}* — 🏆 جایزه برنده: *{_fmt(FRIENDLY_PRIZE)}*",
+            friend_pick_kb(friends),
+        )
+
+
+def _handle_level_pick(chat_id, user, text, mk):
+    parts = user.status.split('_', 2)  # ['levelpick', game_type, mode]
+    game_type = parts[1]
+    mode = parts[2] if len(parts) > 2 else 'online'
+
+    if text == "🔙 بازگشت":
+        _reset_user(user)
+        return _game_menu(chat_id, user, game_type, mk)
+
+    level = _level_from_text(text)
+    if not level:
+        return send_message(chat_id, "⚠️ لطفاً یک سطح را از دکمه‌ها انتخاب کنید:", level_kb())
+
+    entry = LEVELS[level]['entry']
+    prize = LEVELS[level]['prize']
+
+    if user.balance_cents < entry:
+        _reset_user(user)
         return send_message(
             chat_id,
             f"❌ *موجودی ناکافی!*\n\n"
-            f"💰 موجودی: *{_fmt(user.balance_cents)}*\n"
-            f"💸 هزینه کل (شرط + کارمزد جستجو): *{_fmt(total_cost)}*",
+            f"💰 موجودی شما: *{_fmt(user.balance_cents)}*\n"
+            f"💵 هزینه ورود این سطح: *{_fmt(entry)}*",
             mk,
         )
 
-    # Deduct search fee and bet
-    user.balance_cents -= total_cost
+    user.balance_cents -= entry
     user.status = 'idle'
     user.save(update_fields=['balance_cents', 'status'])
 
-    # Check for waiting match
+    if game_type == 'ms':
+        return _start_ms_game(chat_id, user, level, entry, prize)
+
+    if mode == 'bot':
+        return _start_bot_game(chat_id, user, game_type, level, entry, prize)
+
+    # mode == 'online': try to find a waiting opponent at the same level
     waiting = (
         GameMatch.objects
-        .filter(game_type=game_type, bet_cents=cents, status='searching')
+        .filter(game_type=game_type, level=level, mode='online', status='searching')
         .exclude(player1=user)
         .first()
     )
-
     if waiting:
-        _join_match(waiting, user, game_type, cents, mk)
+        _join_match(waiting, user)
     else:
-        _create_search(chat_id, user, game_type, cents, fee)
+        _create_search(chat_id, user, game_type, level, entry, prize)
 
 
-def _create_search(chat_id, user, game_type, bet_cents, fee_cents):
+def _create_search(chat_id, user, game_type, level, entry_cents, prize_cents):
     from rps.tasks import search_animation_task, expire_search_task
     now = timezone.now()
     match = GameMatch.objects.create(
         game_type=game_type,
+        mode='online',
+        level=level,
         player1=user,
-        bet_cents=bet_cents,
-        search_fee_cents=fee_cents,
+        entry_fee_cents=entry_cents,
+        prize_cents=prize_cents,
         status='searching',
         search_started_at=now,
     )
     user.status = f'searching_{match.pk}'
     user.save(update_fields=['status'])
 
-    names = {'rps': 'سنگ کاغذ قیچی', 'ttt': 'دوز', 'c4f': 'چهار در یک'}
-    game_name = names.get(game_type, game_type)
+    game_name = GAME_NAMES.get(game_type, game_type)
+    level_label = LEVELS[level]['label']
 
-    from rps.tg_api import send_message_direct
-    from rps.keyboards import cancel_search_kb
     result = send_message_direct(
         chat_id,
         f"🔍 *در حال جستجوی حریف...*\n\n"
         f"🎮 بازی: *{game_name}*\n"
-        f"💰 شرط: *{_fmt(bet_cents)}*\n\n"
+        f"🎚 سطح: *{level_label}*\n"
+        f"💵 هزینه ورود: *{_fmt(entry_cents)}*\n"
+        f"🏆 جایزه برنده: *{_fmt(prize_cents)}*\n\n"
         "_لطفاً صبر کنید..._",
         cancel_search_kb(),
     )
@@ -912,137 +968,113 @@ def _create_search(chat_id, user, game_type, bet_cents, fee_cents):
     expire_search_task.apply_async(args=[match.pk], countdown=300)
 
 
-def _join_match(match: GameMatch, user: BotUser, game_type: str, bet_cents: int, mk):
-    match.player2 = user
-    match.status = 'active'
-    match.save(update_fields=['player2', 'status'])
-
-    p1 = match.player1
-    p1.status = f'playing_{game_type}_{match.pk}'
-    p1.save(update_fields=['status'])
-    user.status = f'playing_{game_type}_{match.pk}'
-    user.save(update_fields=['status'])
-
-    names = {'rps': 'سنگ کاغذ قیچی', 'ttt': 'دوز', 'c4f': 'چهار در یک'}
-    game_name = names.get(game_type, game_type)
-    p2_name = user.full_name or user.username or "کاربر"
-    p1_name = p1.full_name or p1.username or "کاربر"
-
-    start_msg_p1 = (
-        f"🎉 *حریف پیدا شد!*\n\n"
-        f"🎮 بازی: *{game_name}*\n"
-        f"💰 شرط: *{_fmt(bet_cents)}*\n"
-        f"👤 حریف: *{p2_name}*\n\n"
-    )
-    start_msg_p2 = (
-        f"🎉 *حریف پیدا شد!*\n\n"
-        f"🎮 بازی: *{game_name}*\n"
-        f"💰 شرط: *{_fmt(bet_cents)}*\n"
-        f"👤 حریف: *{p1_name}*\n\n"
-    )
-
-    if game_type == 'rps':
-        move_prompt = "حرکت خود را انتخاب کنید 👇"
-        send_message(p1.chat_id, start_msg_p1 + move_prompt, rps_move_kb())
-        send_message(user.chat_id, start_msg_p2 + move_prompt, rps_move_kb())
-
-    elif game_type == 'ttt':
-        board_str = match.ttt_board
-        send_message(
-            p1.chat_id,
-            start_msg_p1 + "✅ *نوبت شماست* (❌)",
-            ttt_board_kb(board_str, match.pk),
-        )
-        send_message(
-            user.chat_id,
-            start_msg_p2 + "⏳ نوبت حریف است (⭕)",
-            None,
-        )
-
-    elif game_type == 'c4f':
-        board_str = match.c4f_board
-        send_message(
-            p1.chat_id,
-            start_msg_p1 + "✅ *نوبت شماست!* شما 🔴 هستید.\nیک ستون را انتخاب کنید:",
-            c4f_board_kb(board_str, match.pk),
-        )
-        send_message(
-            user.chat_id,
-            start_msg_p2 + "⏳ نوبت حریف است. شما 🟡 هستید.",
-            c4f_board_kb(board_str, match.pk),
-        )
-
-
-def _start_offline_game(chat_id, user, mk):
-    """Start a game against the bot."""
-    status = user.status
-    game_type = 'rps'
-    if 'ttt' in status:
-        game_type = 'ttt'
-    elif 'c4f' in status:
-        game_type = 'c4f'
-    elif status.startswith('bet_'):
-        game_type = status.split('_')[1]
-
-    fees = {'rps': RPS_OFFLINE_FEE, 'ttt': TTT_OFFLINE_FEE, 'c4f': C4F_OFFLINE_FEE}
-    fee = fees.get(game_type, RPS_OFFLINE_FEE)
-
-    if user.balance_cents < fee:
-        user.status = 'idle'
-        user.save(update_fields=['status'])
-        return send_message(
-            chat_id,
-            f"❌ موجودی ناکافی!\n💰 موجودی: *{_fmt(user.balance_cents)}*\n"
-            f"هزینه بازی آفلاین: *{_fmt(fee)}*",
-            mk,
-        )
-
-    user.balance_cents -= fee
-    match = GameMatch.objects.create(
-        game_type=game_type,
-        player1=user,
-        is_offline=True,
-        bet_cents=0,
-        search_fee_cents=0,
-        status='active',
-    )
-    user.status = f'playing_{game_type}_{match.pk}'
-    user.save(update_fields=['balance_cents', 'status'])
-
-    if game_type == 'rps':
-        send_message(chat_id,
-            "🤖 *بازی آفلاین – سنگ کاغذ قیچی*\n\nحرکت خود را انتخاب کنید:",
-            rps_move_kb())
-    elif game_type == 'ttt':
-        send_message(chat_id,
-            "🤖 *بازی آفلاین – دوز*\n\nشما ❌ هستید. نوبت شماست!\nیک خانه را انتخاب کنید:",
-            ttt_board_kb(match.ttt_board, match.pk))
-    elif game_type == 'c4f':
-        send_message(chat_id,
-            "🤖 *بازی آفلاین – چهار در یک*\n\nشما 🔴 هستید. نوبت شماست!\nیک ستون را انتخاب کنید:",
-            c4f_board_kb(match.c4f_board, match.pk))
-
-
 def _cancel_search(chat_id, user, mk):
-    """Cancel search and refund fee."""
+    """Cancel search / a pending friendly invite and refund the entry fee."""
     status = user.status
     if not status.startswith('searching_'):
         return send_message(chat_id, "⚠️ جستجویی فعال نیست.", mk)
     match_id = int(status.split('_')[1])
     try:
         match = GameMatch.objects.get(pk=match_id, status='searching')
-        if match.search_fee_cents > 0:
-            user.balance_cents += match.search_fee_cents
-        # Also refund bet
-        if match.bet_cents > 0:
-            user.balance_cents += match.bet_cents
+        if match.entry_fee_cents > 0:
+            user.balance_cents += match.entry_fee_cents
         match.status = 'cancelled'
         match.save(update_fields=['status'])
     except GameMatch.DoesNotExist:
         pass
     user.status = 'idle'
     user.save(update_fields=['balance_cents', 'status'])
-    send_message(chat_id, "✅ جستجو لغو شد. هزینه به کیف پول شما بازگشت.", mk)
+    send_message(chat_id, "✅ جستجو لغو شد. هزینه ورود به کیف پول شما بازگشت.", mk)
+
+
+def _join_match(match: GameMatch, user: BotUser):
+    """
+    Pairs up player2 with an existing match (either matched from an online
+    search queue, or a friendly invite that was just accepted) and sends
+    the opening message for each game type — capturing message_ids so
+    every following turn can edit these same messages in place.
+    """
+    match.player2 = user
+    match.status = 'active'
+    match.save(update_fields=['player2', 'status'])
+
+    p1 = match.player1
+    p1.status = f'playing_{match.game_type}_{match.pk}'
+    p1.save(update_fields=['status'])
+    user.status = f'playing_{match.game_type}_{match.pk}'
+    user.save(update_fields=['status'])
+
+    game_name = GAME_NAMES.get(match.game_type, match.game_type)
+    p2_name = _display_name(user)
+    p1_name = _display_name(p1)
+    fee_line = f"💵 هزینه ورود: *{_fmt(match.entry_fee_cents)}*  🏆 جایزه برنده: *{_fmt(match.prize_cents)}*\n\n"
+
+    header_p1 = f"🎉 *حریف پیدا شد!*\n\n🎮 بازی: *{game_name}*\n👤 حریف: *{p2_name}*\n{fee_line}"
+    header_p2 = f"🎉 *حریف پیدا شد!*\n\n🎮 بازی: *{game_name}*\n👤 حریف: *{p1_name}*\n{fee_line}"
+
+    if match.game_type == 'rps':
+        move_prompt = "🥊 *دور 1 از 3* — حرکت خود را انتخاب کنید 👇"
+        r1 = send_message_direct(p1.chat_id, header_p1 + move_prompt, rps_move_kb())
+        r2 = send_message_direct(user.chat_id, header_p2 + move_prompt, rps_move_kb())
+        match.p1_msg_id = r1['result']['message_id'] if r1 and r1.get('ok') else None
+        match.p2_msg_id = r2['result']['message_id'] if r2 and r2.get('ok') else None
+        match.save(update_fields=['p1_msg_id', 'p2_msg_id'])
+
+    elif match.game_type == 'ttt':
+        board_str = match.ttt_board
+        r1 = send_message_direct(p1.chat_id, header_p1 + "✅ *نوبت شماست* (❌)", ttt_board_kb(board_str, match.pk))
+        r2 = send_message_direct(user.chat_id, header_p2 + "⏳ نوبت حریف است (⭕)", ttt_board_kb(board_str, match.pk))
+        match.p1_msg_id = r1['result']['message_id'] if r1 and r1.get('ok') else None
+        match.p2_msg_id = r2['result']['message_id'] if r2 and r2.get('ok') else None
+        match.save(update_fields=['p1_msg_id', 'p2_msg_id'])
+
+    elif match.game_type == 'c4f':
+        board_str = match.c4f_board
+        r1 = send_message_direct(p1.chat_id, header_p1 + "✅ *نوبت شماست!* شما 🔴 هستید.\nیک ستون را انتخاب کنید:", c4f_board_kb(board_str, match.pk))
+        r2 = send_message_direct(user.chat_id, header_p2 + "⏳ نوبت حریف است. شما 🟡 هستید.", c4f_board_kb(board_str, match.pk))
+        match.p1_msg_id = r1['result']['message_id'] if r1 and r1.get('ok') else None
+        match.p2_msg_id = r2['result']['message_id'] if r2 and r2.get('ok') else None
+        match.save(update_fields=['p1_msg_id', 'p2_msg_id'])
+
+
+def _start_bot_game(chat_id, user, game_type, level, entry_cents, prize_cents):
+    """Start a game against the bot (fixed level → entry fee → prize)."""
+    match = GameMatch.objects.create(
+        game_type=game_type,
+        mode='bot',
+        level=level,
+        player1=user,
+        is_offline=True,
+        entry_fee_cents=entry_cents,
+        prize_cents=prize_cents,
+        status='active',
+    )
+    user.status = f'playing_{game_type}_{match.pk}'
+    user.save(update_fields=['status'])
+
+    level_label = LEVELS[level]['label']
+    header = (
+        f"🤖 *بازی با ربات – {GAME_NAMES[game_type]}*\n\n"
+        f"🎚 سطح: *{level_label}*  💵 ورود: *{_fmt(entry_cents)}*  🏆 جایزه: *{_fmt(prize_cents)}*\n\n"
+    )
+
+    if game_type == 'rps':
+        r = send_message_direct(chat_id, header + "🥊 *دور 1 از 3* — حرکت خود را انتخاب کنید:", rps_move_kb())
+    elif game_type == 'ttt':
+        r = send_message_direct(chat_id, header + "شما ❌ هستید. نوبت شماست!\nیک خانه را انتخاب کنید:", ttt_board_kb(match.ttt_board, match.pk))
+    elif game_type == 'c4f':
+        r = send_message_direct(chat_id, header + "شما 🔴 هستید. نوبت شماست!\nیک ستون را انتخاب کنید:", c4f_board_kb(match.c4f_board, match.pk))
+    else:
+        r = None
+
+    if r and r.get('ok'):
+        match.p1_msg_id = r['result']['message_id']
+        match.save(update_fields=['p1_msg_id'])
+
+
+# ─── RPS (best of 3) ───────────────────────────────────────────────────────────
+
+RPS_MOVES = ("🪨 سنگ", "📄 کاغذ", "✂️ قیچی")
 
 
 def _handle_rps_move(chat_id, user, text, mk):
@@ -1055,92 +1087,119 @@ def _handle_rps_move(chat_id, user, text, mk):
     except GameMatch.DoesNotExist:
         return send_message(chat_id, "⚠️ بازی یافت نشد.", mk)
 
-    if text not in ("🪨 سنگ", "📄 کاغذ", "✂️ قیچی"):
+    if text not in RPS_MOVES:
         return
 
     if match.player1.chat_id == chat_id:
         if match.p1_move:
-            return send_message(chat_id, "⏳ حرکت شما ثبت شده، منتظر حریف...")
+            return
         match.p1_move = text
     else:
         if match.p2_move:
-            return send_message(chat_id, "⏳ حرکت شما ثبت شده، منتظر حریف...")
+            return
         match.p2_move = text
     match.save(update_fields=['p1_move', 'p2_move'])
 
-    if match.is_offline:
-        # Bot makes its move
-        bot_moves = ["🪨 سنگ", "📄 کاغذ", "✂️ قیچی"]
-        match.p2_move = random.choice(bot_moves)
+    if match.is_offline and not match.p2_move:
+        match.p2_move = random.choice(RPS_MOVES)
         match.save(update_fields=['p2_move'])
-        _finish_rps(match, mk)
-    elif match.p1_move and match.p2_move:
-        _finish_rps(match, mk)
-    else:
-        send_message(chat_id, "✅ حرکت ثبت شد. ⏳ منتظر حریف...")
+
+    if match.p1_move and match.p2_move:
+        _resolve_rps_round(match, mk)
 
 
-def _finish_rps(match: GameMatch, mk):
-    p1 = match.player1
-    p2 = match.player2
+def _resolve_rps_round(match: GameMatch, mk):
+    p1, p2 = match.player1, match.player2
+    result = match.rps_round_winner()
     m1, m2 = match.p1_move, match.p2_move
 
-    wins_over = {"🪨 سنگ": "✂️ قیچی", "📄 کاغذ": "🪨 سنگ", "✂️ قیچی": "📄 کاغذ"}
+    if result == 'draw':
+        # Replay the same round — it does not count toward the 2-win target.
+        match.p1_move = None
+        match.p2_move = None
+        match.save(update_fields=['p1_move', 'p2_move'])
+        _edit_rps(match, p1.chat_id, match.p1_msg_id,
+                  f"🤝 *دور {match.rps_round} مساوی شد!*\n\nشما: {m1}\nحریف: {m2}\n\n🔁 همین دور را دوباره بازی کنید:")
+        if match.p2_msg_id:
+            _edit_rps(match, p2.chat_id, match.p2_msg_id,
+                      f"🤝 *دور {match.rps_round} مساوی شد!*\n\nشما: {m2}\nحریف: {m1}\n\n🔁 همین دور را دوباره بازی کنید:")
+        return
 
-    if m1 == m2:
-        result = 'draw'
-    elif wins_over[m1] == m2:
-        result = 'p1'
+    if result == 'p1':
+        match.rps_p1_wins += 1
     else:
-        result = 'p2'
+        match.rps_p2_wins += 1
 
+    if match.rps_p1_wins == 2 or match.rps_p2_wins == 2:
+        match.save(update_fields=['rps_p1_wins', 'rps_p2_wins'])
+        return _finish_rps_match(match)
+
+    # Otherwise, move to the next round.
+    match.rps_round += 1
+    match.p1_move = None
+    match.p2_move = None
+    match.save(update_fields=['rps_round', 'rps_p1_wins', 'rps_p2_wins', 'p1_move', 'p2_move'])
+
+    score_line = f"📊 نتیجه: شما {match.rps_p1_wins} – حریف {match.rps_p2_wins}"
+    _edit_rps(match, p1.chat_id, match.p1_msg_id,
+              f"{'🎉' if result=='p1' else '💀'} *دور را {'بردید' if result=='p1' else 'باختید'}!*\n\n"
+              f"شما: {m1}\nحریف: {m2}\n\n{score_line}\n\n🥊 *دور {match.rps_round} از 3* — حرکت بعدی خود را انتخاب کنید:")
+    if match.p2_msg_id:
+        score_line2 = f"📊 نتیجه: شما {match.rps_p2_wins} – حریف {match.rps_p1_wins}"
+        _edit_rps(match, p2.chat_id, match.p2_msg_id,
+                  f"{'🎉' if result=='p2' else '💀'} *دور را {'بردید' if result=='p2' else 'باختید'}!*\n\n"
+                  f"شما: {m2}\nحریف: {m1}\n\n{score_line2}\n\n🥊 *دور {match.rps_round} از 3* — حرکت بعدی خود را انتخاب کنید:")
+
+
+def _edit_rps(match, chat_id, msg_id, text):
+    from rps.tg_api import edit_message
+    if msg_id:
+        edit_message(chat_id, msg_id, text)
+    else:
+        send_message(chat_id, text)
+
+
+def _finish_rps_match(match: GameMatch):
+    p1, p2 = match.player1, match.player2
     p1_mk = main_menu(_is_admin(p1.chat_id))
     p2_mk = main_menu(_is_admin(p2.chat_id)) if p2 else None
+    p1_won = match.rps_p1_wins == 2
 
-    if result == 'draw':
-        # Refund both
-        p1.balance_cents += match.bet_cents
-        p1.wins += 0; p1.losses += 0; p1.total_games += 1
-        send_message(p1.chat_id, f"🤝 *مساوی!*\n\nشما: {m1}\nحریف: {m2}\n\n💰 شرط برگشت داده شد.", p1_mk)
-        if p2 and not match.is_offline:
-            p2.balance_cents += match.bet_cents
-            p2.total_games += 1
-            send_message(p2.chat_id, f"🤝 *مساوی!*\n\nشما: {m2}\nحریف: {m1}\n\n💰 شرط برگشت داده شد.", p2_mk)
+    score_text = f"📊 نتیجه نهایی: {match.rps_p1_wins} – {match.rps_p2_wins}"
 
-    elif result == 'p1':
-        if match.is_offline:
-            prize = RPS_OFFLINE_WIN
-            p1.balance_cents += prize; p1.wins += 1; p1.total_games += 1
-            send_message(p1.chat_id,
-                f"🎉 *بردید!*\n\nشما: {m1}\nربات: {m2}\n\n💰 جایزه: *{_fmt(prize)}* به کیف پول اضافه شد.", p1_mk)
+    if match.is_offline:
+        if p1_won:
+            p1.balance_cents += match.prize_cents
+            p1.wins += 1
+            _edit_rps(match, p1.chat_id, match.p1_msg_id, f"🎉 *بردید!*\n\n{score_text}\n💰 جایزه: *{_fmt(match.prize_cents)}*")
         else:
-            # Winner takes both bets (search fees already deducted)
-            prize = match.bet_cents * 2
-            p1.balance_cents += prize; p1.wins += 1; p1.total_games += 1
-            send_message(p1.chat_id,
-                f"🎉 *بردید!*\n\nشما: {m1}\nحریف: {m2}\n\n💰 برنده: *{_fmt(prize)}*", p1_mk)
-            if p2:
-                p2.losses += 1; p2.total_games += 1
-                send_message(p2.chat_id,
-                    f"💀 *باختید!*\n\nشما: {m2}\nحریف: {m1}", p2_mk)
-
-    else:  # p2 wins
-        if match.is_offline:
-            p1.losses += 1; p1.total_games += 1
-            send_message(p1.chat_id,
-                f"💀 *باختید!*\n\nشما: {m1}\nربات: {m2}", p1_mk)
+            p1.losses += 1
+            _edit_rps(match, p1.chat_id, match.p1_msg_id, f"💀 *باختید!*\n\n{score_text}")
+        p1.total_games += 1
+        p1.status = 'idle'
+        p1.save(update_fields=['balance_cents', 'wins', 'losses', 'total_games', 'status'])
+        send_message(p1.chat_id, "بازی تمام شد. یک گزینه انتخاب کنید 👇", p1_mk)
+    else:
+        if p1_won:
+            p1.balance_cents += match.prize_cents
+            p1.wins += 1; p2.losses += 1
+            _edit_rps(match, p1.chat_id, match.p1_msg_id, f"🎉 *بردید!*\n\n{score_text}\n💰 جایزه: *{_fmt(match.prize_cents)}*")
+            _edit_rps(match, p2.chat_id, match.p2_msg_id, f"💀 *باختید!*\n\n{score_text}")
         else:
-            prize = match.bet_cents * 2
-            p2.balance_cents += prize; p2.wins += 1; p2.total_games += 1
-            send_message(p2.chat_id,
-                f"🎉 *بردید!*\n\nشما: {m2}\nحریف: {m1}\n\n💰 برنده: *{_fmt(prize)}*", p2_mk)
-            p1.losses += 1; p1.total_games += 1
-            send_message(p1.chat_id,
-                f"💀 *باختید!*\n\nشما: {m1}\nحریف: {m2}", p1_mk)
+            p2.balance_cents += match.prize_cents
+            p2.wins += 1; p1.losses += 1
+            _edit_rps(match, p2.chat_id, match.p2_msg_id, f"🎉 *بردید!*\n\n{score_text}\n💰 جایزه: *{_fmt(match.prize_cents)}*")
+            _edit_rps(match, p1.chat_id, match.p1_msg_id, f"💀 *باختید!*\n\n{score_text}")
+        p1.total_games += 1; p2.total_games += 1
+        p1.status = 'idle'; p2.status = 'idle'
+        p1.save(update_fields=['balance_cents', 'wins', 'losses', 'total_games', 'status'])
+        p2.save(update_fields=['balance_cents', 'wins', 'losses', 'total_games', 'status'])
+        send_message(p1.chat_id, "بازی تمام شد. یک گزینه انتخاب کنید 👇", p1_mk)
+        send_message(p2.chat_id, "بازی تمام شد. یک گزینه انتخاب کنید 👇", p2_mk)
 
-    p1.status = 'idle'; p1.save()
-    if p2: p2.status = 'idle'; p2.save()
-    match.status = 'finished'; match.finished_at = timezone.now(); match.save()
+    match.status = 'finished'
+    match.finished_at = timezone.now()
+    match.save(update_fields=['status', 'finished_at'])
 
 
 # ─── Tic-Tac-Toe (callback handled in views.py) ──────────────────────────────
@@ -1190,56 +1249,67 @@ def handle_ttt_move(match: GameMatch, player: BotUser, position: int) -> str:
 def _finish_ttt(match: GameMatch, winner):
     p1 = match.player1
     p2 = match.player2
-    p1_mk = main_menu(_is_admin(p1.chat_id))
-    p2_mk = main_menu(_is_admin(p2.chat_id)) if p2 else None
     board_visual = _ttt_visual(match.ttt_board)
 
     if winner == 'draw':
-        p1.balance_cents += match.bet_cents
-        p1.total_games += 1; p1.save()
-        send_message(p1.chat_id, f"🤝 *مساوی!*\n\n{board_visual}\n\n💰 شرط برگشت داده شد.", p1_mk)
+        p1.total_games += 1; p1.status = 'idle'; p1.save(update_fields=['total_games', 'status'])
+        _edit_board(p1.chat_id, match.p1_msg_id, f"🤝 *مساوی!*\n\n{board_visual}")
+        send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
         if p2 and not match.is_offline:
-            p2.balance_cents += match.bet_cents
-            p2.total_games += 1; p2.save()
-            send_message(p2.chat_id, f"🤝 *مساوی!*\n\n{board_visual}\n\n💰 شرط برگشت داده شد.", p2_mk)
+            p2.total_games += 1; p2.status = 'idle'; p2.save(update_fields=['total_games', 'status'])
+            _edit_board(p2.chat_id, match.p2_msg_id, f"🤝 *مساوی!*\n\n{board_visual}")
+            send_message(p2.chat_id, "بازی تمام شد.", main_menu(_is_admin(p2.chat_id)))
 
     elif winner == 'X':  # p1 wins
         if match.is_offline:
-            prize = TTT_OFFLINE_WIN
-            p1.balance_cents += prize; p1.wins += 1; p1.total_games += 1; p1.save()
-            send_message(p1.chat_id,
-                f"🎉 *بردید!*\n\n{board_visual}\n\n💰 جایزه: *{_fmt(prize)}*", p1_mk)
+            p1.balance_cents += match.prize_cents; p1.wins += 1; p1.total_games += 1
+            p1.status = 'idle'; p1.save(update_fields=['balance_cents', 'wins', 'total_games', 'status'])
+            _edit_board(p1.chat_id, match.p1_msg_id, f"🎉 *بردید!*\n\n{board_visual}\n\n💰 جایزه: *{_fmt(match.prize_cents)}*")
+            send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
         else:
-            prize = match.bet_cents * 2
-            p1.balance_cents += prize; p1.wins += 1; p1.total_games += 1; p1.save()
-            send_message(p1.chat_id,
-                f"🎉 *بردید!*\n\n{board_visual}\n\n💰 برنده: *{_fmt(prize)}*", p1_mk)
+            p1.balance_cents += match.prize_cents; p1.wins += 1; p1.total_games += 1
+            p1.status = 'idle'; p1.save(update_fields=['balance_cents', 'wins', 'total_games', 'status'])
+            _edit_board(p1.chat_id, match.p1_msg_id, f"🎉 *بردید!*\n\n{board_visual}\n\n🏆 جایزه: *{_fmt(match.prize_cents)}*")
+            send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
             if p2:
-                p2.losses += 1; p2.total_games += 1; p2.save()
-                send_message(p2.chat_id, f"💀 *باختید!*\n\n{board_visual}", p2_mk)
+                p2.losses += 1; p2.total_games += 1
+                p2.status = 'idle'; p2.save(update_fields=['losses', 'total_games', 'status'])
+                _edit_board(p2.chat_id, match.p2_msg_id, f"💀 *باختید!*\n\n{board_visual}")
+                send_message(p2.chat_id, "بازی تمام شد.", main_menu(_is_admin(p2.chat_id)))
 
     else:  # O wins = p2
         if match.is_offline:
-            p1.losses += 1; p1.total_games += 1; p1.save()
-            send_message(p1.chat_id, f"💀 *باختید!*\n\n{board_visual}", p1_mk)
+            p1.losses += 1; p1.total_games += 1
+            p1.status = 'idle'; p1.save(update_fields=['losses', 'total_games', 'status'])
+            _edit_board(p1.chat_id, match.p1_msg_id, f"💀 *باختید!*\n\n{board_visual}")
+            send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
         else:
-            prize = match.bet_cents * 2
-            p2.balance_cents += prize; p2.wins += 1; p2.total_games += 1; p2.save()
-            send_message(p2.chat_id,
-                f"🎉 *بردید!*\n\n{board_visual}\n\n💰 برنده: *{_fmt(prize)}*", p2_mk)
-            p1.losses += 1; p1.total_games += 1; p1.save()
-            send_message(p1.chat_id, f"💀 *باختید!*\n\n{board_visual}", p1_mk)
+            p2.balance_cents += match.prize_cents; p2.wins += 1; p2.total_games += 1
+            p2.status = 'idle'; p2.save(update_fields=['balance_cents', 'wins', 'total_games', 'status'])
+            _edit_board(p2.chat_id, match.p2_msg_id, f"🎉 *بردید!*\n\n{board_visual}\n\n🏆 جایزه: *{_fmt(match.prize_cents)}*")
+            send_message(p2.chat_id, "بازی تمام شد.", main_menu(_is_admin(p2.chat_id)))
+            p1.losses += 1; p1.total_games += 1
+            p1.status = 'idle'; p1.save(update_fields=['losses', 'total_games', 'status'])
+            _edit_board(p1.chat_id, match.p1_msg_id, f"💀 *باختید!*\n\n{board_visual}")
+            send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
 
-    p1.status = 'idle'; p1.save(update_fields=['status'])
-    if p2: p2.status = 'idle'; p2.save(update_fields=['status'])
     match.status = 'finished'; match.finished_at = timezone.now(); match.save()
 
 
+def _edit_board(chat_id, msg_id, text, kb=None):
+    from rps.tg_api import edit_message
+    if msg_id:
+        edit_message(chat_id, msg_id, text, kb)
+    else:
+        send_message(chat_id, text, kb)
+
+
 def _send_ttt_board(match: GameMatch):
-    """Update both players with the current board."""
+    """Update both players' existing messages with the current board (no new messages)."""
     p1 = match.player1
     p2 = match.player2
     board = match.ttt_board
+    kb = ttt_board_kb(board, match.pk)
 
     if match.ttt_turn == 1:
         turn_p1 = "✅ *نوبت شماست* (❌)"
@@ -1248,9 +1318,9 @@ def _send_ttt_board(match: GameMatch):
         turn_p1 = "⏳ نوبت حریف است"
         turn_p2 = "✅ *نوبت شماست* (⭕)"
 
-    send_message(p1.chat_id, turn_p1, ttt_board_kb(board, match.pk))
+    _edit_board(p1.chat_id, match.p1_msg_id, turn_p1, kb)
     if p2:
-        send_message(p2.chat_id, turn_p2, ttt_board_kb(board, match.pk))
+        _edit_board(p2.chat_id, match.p2_msg_id, turn_p2, kb)
 
 
 def _ttt_visual(board: str) -> str:
@@ -1262,6 +1332,220 @@ def _ttt_visual(board: str) -> str:
     return '\n'.join(rows)
 
 
+# ─── Connect Four (callback handled in views.py) ─────────────────────────────
+
+def handle_c4f_move(match: GameMatch, player: BotUser, col: int) -> str:
+    """
+    Called from callback handler in views.py.
+    Returns: 'ok' | 'not_your_turn' | 'col_full' | 'already_done'
+    """
+    if match.status != 'active':
+        return 'already_done'
+
+    is_p1 = match.player1.chat_id == player.chat_id
+    is_p2 = match.player2 and match.player2.chat_id == player.chat_id
+    if not is_p1 and not is_p2:
+        return 'not_your_turn'
+
+    expected_turn = 1 if is_p1 else 2
+    if match.c4f_turn != expected_turn:
+        return 'not_your_turn'
+
+    symbol = 'R' if is_p1 else 'Y'
+    row = match.c4f_drop(col, symbol)
+    if row == -1:
+        return 'col_full'
+
+    match.c4f_turn = 2 if is_p1 else 1
+    match.save(update_fields=['c4f_board', 'c4f_turn'])
+
+    winner = match.c4f_check_winner()
+
+    if match.is_offline and winner is None:
+        # Bot plays immediately
+        bot_col = match.c4f_bot_move()
+        match.c4f_drop(bot_col, 'Y')
+        match.c4f_turn = 1
+        match.save(update_fields=['c4f_board', 'c4f_turn'])
+        winner = match.c4f_check_winner()
+
+    if winner:
+        _finish_c4f(match, winner)
+    else:
+        _send_c4f_board(match)
+
+    return 'ok'
+
+
+def _finish_c4f(match: GameMatch, winner: str):
+    p1 = match.player1
+    p2 = match.player2
+    board_visual = _c4f_visual(match.c4f_board)
+
+    if winner == 'draw':
+        p1.total_games += 1; p1.status = 'idle'; p1.save(update_fields=['total_games', 'status'])
+        _edit_board(p1.chat_id, match.p1_msg_id, f"🤝 *مساوی!*\n\n{board_visual}")
+        send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
+        if p2 and not match.is_offline:
+            p2.total_games += 1; p2.status = 'idle'; p2.save(update_fields=['total_games', 'status'])
+            _edit_board(p2.chat_id, match.p2_msg_id, f"🤝 *مساوی!*\n\n{board_visual}")
+            send_message(p2.chat_id, "بازی تمام شد.", main_menu(_is_admin(p2.chat_id)))
+
+    elif winner == 'R':  # p1 wins
+        p1.balance_cents += match.prize_cents; p1.wins += 1; p1.total_games += 1
+        p1.status = 'idle'; p1.save(update_fields=['balance_cents', 'wins', 'total_games', 'status'])
+        _edit_board(p1.chat_id, match.p1_msg_id, f"🎉 *بردید!*\n\n{board_visual}\n\n🏆 جایزه: *{_fmt(match.prize_cents)}*")
+        send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
+        if p2 and not match.is_offline:
+            p2.losses += 1; p2.total_games += 1
+            p2.status = 'idle'; p2.save(update_fields=['losses', 'total_games', 'status'])
+            _edit_board(p2.chat_id, match.p2_msg_id, f"💀 *باختید!*\n\n{board_visual}")
+            send_message(p2.chat_id, "بازی تمام شد.", main_menu(_is_admin(p2.chat_id)))
+        elif match.is_offline:
+            pass
+
+    else:  # 'Y' = p2 wins
+        if match.is_offline:
+            p1.losses += 1; p1.total_games += 1
+            p1.status = 'idle'; p1.save(update_fields=['losses', 'total_games', 'status'])
+            _edit_board(p1.chat_id, match.p1_msg_id, f"💀 *باختید!*\n\n{board_visual}")
+            send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
+        else:
+            p2.balance_cents += match.prize_cents; p2.wins += 1; p2.total_games += 1
+            p2.status = 'idle'; p2.save(update_fields=['balance_cents', 'wins', 'total_games', 'status'])
+            _edit_board(p2.chat_id, match.p2_msg_id, f"🎉 *بردید!*\n\n{board_visual}\n\n🏆 جایزه: *{_fmt(match.prize_cents)}*")
+            send_message(p2.chat_id, "بازی تمام شد.", main_menu(_is_admin(p2.chat_id)))
+            p1.losses += 1; p1.total_games += 1
+            p1.status = 'idle'; p1.save(update_fields=['losses', 'total_games', 'status'])
+            _edit_board(p1.chat_id, match.p1_msg_id, f"💀 *باختید!*\n\n{board_visual}")
+            send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
+
+    match.status = 'finished'; match.finished_at = timezone.now(); match.save()
+
+
+def _send_c4f_board(match: GameMatch):
+    """Update both players' existing messages with the current board (no new messages)."""
+    p1 = match.player1
+    p2 = match.player2
+    board = match.c4f_board
+    kb = c4f_board_kb(board, match.pk)
+
+    if match.c4f_turn == 1:
+        _edit_board(p1.chat_id, match.p1_msg_id, "✅ *نوبت شماست!* 🔴 یک ستون انتخاب کنید:", kb)
+        if p2:
+            _edit_board(p2.chat_id, match.p2_msg_id, "⏳ نوبت حریف است... 🟡", kb)
+    else:
+        if p2:
+            _edit_board(p2.chat_id, match.p2_msg_id, "✅ *نوبت شماست!* 🟡 یک ستون انتخاب کنید:", kb)
+        _edit_board(p1.chat_id, match.p1_msg_id, "⏳ نوبت حریف است... 🔴", kb)
+
+
+def _c4f_visual(board: str) -> str:
+    """Render the 6×7 board as emoji text for result messages."""
+    cell = {'.': '⬜', 'R': '🔴', 'Y': '🟡'}
+    col_nums = "1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣"
+    rows = [col_nums]
+    for row in range(5, -1, -1):  # top to bottom
+        rows.append(''.join(cell[board[row * 7 + col]] for col in range(7)))
+    return '\n'.join(rows)
+
+
+# ─── Minesweeper (solo — callback handled in views.py) ────────────────────────
+
+def _start_ms_game(chat_id, user, level, entry_cents, prize_cents):
+    match = GameMatch.objects.create(
+        game_type='ms',
+        mode='solo',
+        level=level,
+        player1=user,
+        is_offline=True,
+        entry_fee_cents=entry_cents,
+        prize_cents=prize_cents,
+        status='active',
+    )
+    match.ms_generate(mines=MS_MINES)
+    match.save(update_fields=['ms_board', 'ms_revealed', 'ms_mines'])
+
+    user.status = f'playing_ms_{match.pk}'
+    user.save(update_fields=['status'])
+
+    level_label = LEVELS[level]['label']
+    header = (
+        f"💣 *ماین‌یاب – {level_label}*\n\n"
+        f"💵 ورود: *{_fmt(entry_cents)}*  🏆 جایزه: *{_fmt(prize_cents)}*\n"
+        f"💣 تعداد مین‌ها: *{MS_MINES}*\n\n"
+        "یک خانه را باز کنید 👇"
+    )
+    r = send_message_direct(chat_id, header, ms_board_kb(match.ms_board, match.ms_revealed, match.pk))
+    if r and r.get('ok'):
+        match.p1_msg_id = r['result']['message_id']
+        match.save(update_fields=['p1_msg_id'])
+
+
+def handle_ms_move(match: GameMatch, player: BotUser, index: int) -> str:
+    """
+    Called from callback handler in views.py.
+    Returns: 'ok' | 'mine' | 'win' | 'already' | 'already_done' | 'invalid'
+    """
+    if match.status != 'active':
+        return 'already_done'
+    if match.player1.chat_id != player.chat_id:
+        return 'invalid'
+
+    res = match.ms_reveal(index)
+    if res == 'already':
+        match.save(update_fields=['ms_revealed'])
+        return 'already'
+
+    if res == 'mine':
+        # Reveal every mine for a satisfying "game over" board.
+        revealed = list(match.ms_revealed)
+        for i, cell in enumerate(match.ms_board):
+            if cell == '*':
+                revealed[i] = '1'
+        match.ms_revealed = ''.join(revealed)
+        match.save(update_fields=['ms_revealed'])
+        _finish_ms(match, won=False)
+        return 'mine'
+
+    if match.ms_is_won():
+        match.save(update_fields=['ms_revealed'])
+        _finish_ms(match, won=True)
+        return 'win'
+
+    match.save(update_fields=['ms_revealed'])
+    _edit_board(
+        match.player1.chat_id, match.p1_msg_id,
+        "💣 *ماین‌یاب*\n\nخانه بعدی را باز کنید 👇",
+        ms_board_kb(match.ms_board, match.ms_revealed, match.pk),
+    )
+    return 'ok'
+
+
+def _finish_ms(match: GameMatch, won: bool):
+    p1 = match.player1
+    kb = ms_board_kb(match.ms_board, match.ms_revealed, match.pk)
+
+    if won:
+        p1.balance_cents += match.prize_cents
+        p1.wins += 1
+        text = f"🎉 *بردید! همه خانه‌های امن باز شد.*\n\n💰 جایزه: *{_fmt(match.prize_cents)}*"
+    else:
+        p1.losses += 1
+        text = "💥 *به مین خوردید!*\n\nهزینه ورود بازگردانده نمی‌شود. دوباره امتحان کنید!"
+
+    p1.total_games += 1
+    p1.status = 'idle'
+    p1.save(update_fields=['balance_cents', 'wins', 'losses', 'total_games', 'status'])
+
+    _edit_board(p1.chat_id, match.p1_msg_id, text, kb)
+    send_message(p1.chat_id, "بازی تمام شد.", main_menu(_is_admin(p1.chat_id)))
+
+    match.status = 'finished'
+    match.finished_at = timezone.now()
+    match.save(update_fields=['status', 'finished_at'])
+
+
 # ─── Friends ─────────────────────────────────────────────────────────────────
 
 def _friends_menu(chat_id, user):
@@ -1271,6 +1555,7 @@ def _friends_menu(chat_id, user):
         chat_id,
         f"👥 *دوستان*\n\n"
         f"📨 درخواست‌های دریافتی{badge}\n\n"
+        "درخواست دوستی کاملاً *رایگان* است.\n"
         "برای افزودن دوست، یوزرنیم یا chat_id آن‌ها را وارد کنید:",
         friends_menu_kb(),
     )
@@ -1328,19 +1613,11 @@ def _handle_search_friend(chat_id, user, text, mk):
     if FriendRequest.objects.filter(sender=user, receiver=target, status='pending').exists():
         return send_message(chat_id, "⏳ درخواست دوستی قبلاً ارسال شده، منتظر پاسخ باشید.", friends_menu_kb())
 
-    if user.balance_cents < FRIEND_REQ_FEE:
-        return send_message(
-            chat_id,
-            f"❌ موجودی ناکافی!\n💰 هزینه ارسال درخواست دوستی: *{_fmt(FRIEND_REQ_FEE)}*\n"
-            f"💰 موجودی شما: *{_fmt(user.balance_cents)}*",
-            friends_menu_kb(),
-        )
-
-    user.balance_cents -= FRIEND_REQ_FEE
+    # Friend requests are free.
     user.status = 'idle'
-    user.save(update_fields=['balance_cents', 'status'])
+    user.save(update_fields=['status'])
 
-    req = FriendRequest.objects.create(sender=user, receiver=target, fee_paid=True)
+    req = FriendRequest.objects.create(sender=user, receiver=target)
     sender_name = user.full_name or user.username or str(user.chat_id)
 
     send_message(
@@ -1353,18 +1630,59 @@ def _handle_search_friend(chat_id, user, text, mk):
     send_message(chat_id, f"✅ درخواست دوستی به *{target.full_name or target.username}* ارسال شد!", friends_menu_kb())
 
 
-def _invite_friend_to_game(chat_id, user):
-    friends = Friendship.get_friends(user)
-    if not friends:
-        return send_message(chat_id, "👥 هنوز دوستی ندارید. ابتدا یک دوست اضافه کنید.", friends_menu_kb())
-    # Show selection (simple text list for now)
-    msg = "🎮 *دعوت به بازی*\n\nchat_id دوستتان را وارد کنید:\n\n"
-    for f in friends[:10]:
-        name = f.full_name or f.username or str(f.chat_id)
-        msg += f"• `{f.chat_id}` – {name}\n"
-    user.status = 'invite_friend_game'
-    user.save(update_fields=['status'])
-    send_message(chat_id, msg, back_kb())
+def _handle_friend_pick(chat_id, user, text, mk):
+    game_type = user.status.split('_', 1)[1]
+
+    if text == "🔙 بازگشت":
+        _reset_user(user)
+        return _game_menu(chat_id, user, game_type, mk)
+
+    match = re.search(r'\((\-?\d+)\)\s*$', text or "")
+    if not match:
+        return send_message(chat_id, "⚠️ لطفاً یک دوست را از دکمه‌ها انتخاب کنید:")
+    target_chat_id = int(match.group(1))
+
+    try:
+        target = BotUser.objects.get(chat_id=target_chat_id)
+    except BotUser.DoesNotExist:
+        return send_message(chat_id, "❌ این کاربر یافت نشد.")
+
+    if not Friendship.are_friends(user, target):
+        return send_message(chat_id, "⚠️ این کاربر در لیست دوستان شما نیست.")
+
+    if user.balance_cents < FRIENDLY_ENTRY_FEE:
+        _reset_user(user)
+        return send_message(
+            chat_id,
+            f"❌ موجودی ناکافی!\n💵 هزینه ورود بازی دوستانه: *{_fmt(FRIENDLY_ENTRY_FEE)}*\n"
+            f"💰 موجودی شما: *{_fmt(user.balance_cents)}*",
+            mk,
+        )
+
+    user.balance_cents -= FRIENDLY_ENTRY_FEE
+    user.status = 'idle'
+    user.save(update_fields=['balance_cents', 'status'])
+
+    match_obj = GameMatch.objects.create(
+        game_type=game_type,
+        mode='friendly',
+        level='friendly',
+        player1=user,
+        entry_fee_cents=FRIENDLY_ENTRY_FEE,
+        prize_cents=FRIENDLY_PRIZE,
+        status='searching',
+    )
+
+    sender_name = _display_name(user)
+    send_message(
+        target.chat_id,
+        f"🎮 *دعوت به بازی دوستانه!*\n\n"
+        f"👤 از: *{sender_name}*\n"
+        f"🕹 بازی: *{GAME_NAMES[game_type]}*\n"
+        f"💵 هزینه ورود شما: *{_fmt(FRIENDLY_ENTRY_FEE)}*  🏆 جایزه برنده: *{_fmt(FRIENDLY_PRIZE)}*",
+        game_invite_inline_kb(match_obj.pk),
+    )
+    send_message(chat_id, f"✅ دعوت بازی به *{target.full_name or target.username}* ارسال شد!", friends_menu_kb())
 
 
 # ─── Report ───────────────────────────────────────────────────────────────────
@@ -1399,7 +1717,6 @@ def _handle_report_reason(chat_id, user, text, status, mk):
     _reset_user(user)
 
     from rps.tg_api import send_message_direct
-    from rps.keyboards import admin_report_inline_kb
     reporter_name = user.full_name or user.username or str(user.chat_id)
     reported_name = reported.full_name or reported.username or str(reported.chat_id)
     admin_msg = (
@@ -1410,132 +1727,6 @@ def _handle_report_reason(chat_id, user, text, status, mk):
     )
     send_message_direct(TELEGRAM_ADMIN_CHAT_ID, admin_msg, admin_report_inline_kb(report.pk))
     send_message(chat_id, "✅ گزارش شما ثبت شد و به تیم پشتیبانی ارسال گردید.", mk)
-
-
-# ─── Connect Four (callback handled in views.py) ─────────────────────────────
-
-def handle_c4f_move(match: GameMatch, player: BotUser, col: int) -> str:
-    """
-    Called from callback handler in views.py.
-    Returns: 'ok' | 'not_your_turn' | 'col_full' | 'already_done'
-    """
-    if match.status != 'active':
-        return 'already_done'
-
-    is_p1 = match.player1.chat_id == player.chat_id
-    is_p2 = match.player2 and match.player2.chat_id == player.chat_id
-    if not is_p1 and not is_p2:
-        return 'not_your_turn'
-
-    expected_turn = 1 if is_p1 else 2
-    if match.c4f_turn != expected_turn:
-        return 'not_your_turn'
-
-    symbol = 'R' if is_p1 else 'Y'
-    row = match.c4f_drop(col, symbol)
-    if row == -1:
-        return 'col_full'
-
-    match.c4f_turn = 2 if is_p1 else 1
-    match.save(update_fields=['c4f_board', 'c4f_turn'])
-
-    winner = match.c4f_check_winner()
-
-    if match.is_offline and winner is None:
-        # Bot plays immediately
-        bot_col = match.c4f_bot_move()
-        match.c4f_drop(bot_col, 'Y')
-        match.c4f_turn = 1
-        match.save(update_fields=['c4f_board', 'c4f_turn'])
-        winner = match.c4f_check_winner()
-
-    if winner:
-        _finish_c4f(match, winner)
-    else:
-        _send_c4f_board(match)
-
-    return 'ok'
-
-
-def _finish_c4f(match: GameMatch, winner: str):
-    p1 = match.player1
-    p2 = match.player2
-    p1_mk = main_menu(_is_admin(p1.chat_id))
-    p2_mk = main_menu(_is_admin(p2.chat_id)) if p2 else None
-    board_visual = _c4f_visual(match.c4f_board)
-
-    if winner == 'draw':
-        p1.balance_cents += match.bet_cents
-        p1.total_games += 1; p1.save()
-        send_message(p1.chat_id,
-            f"🤝 *مساوی!*\n\n{board_visual}\n\n💰 شرط برگشت داده شد.", p1_mk)
-        if p2 and not match.is_offline:
-            p2.balance_cents += match.bet_cents
-            p2.total_games += 1; p2.save()
-            send_message(p2.chat_id,
-                f"🤝 *مساوی!*\n\n{board_visual}\n\n💰 شرط برگشت داده شد.", p2_mk)
-
-    elif winner == 'R':  # p1 wins
-        if match.is_offline:
-            prize = C4F_OFFLINE_WIN
-            p1.balance_cents += prize; p1.wins += 1; p1.total_games += 1; p1.save()
-            send_message(p1.chat_id,
-                f"🎉 *بردید!*\n\n{board_visual}\n\n💰 جایزه: *{_fmt(prize)}*", p1_mk)
-        else:
-            prize = match.bet_cents * 2
-            p1.balance_cents += prize; p1.wins += 1; p1.total_games += 1; p1.save()
-            send_message(p1.chat_id,
-                f"🎉 *بردید!*\n\n{board_visual}\n\n🏆 برنده: *{_fmt(prize)}*", p1_mk)
-            if p2:
-                p2.losses += 1; p2.total_games += 1; p2.save()
-                send_message(p2.chat_id,
-                    f"💀 *باختید!*\n\n{board_visual}", p2_mk)
-
-    else:  # 'Y' = p2 wins
-        if match.is_offline:
-            p1.losses += 1; p1.total_games += 1; p1.save()
-            send_message(p1.chat_id,
-                f"💀 *باختید!*\n\n{board_visual}", p1_mk)
-        else:
-            prize = match.bet_cents * 2
-            p2.balance_cents += prize; p2.wins += 1; p2.total_games += 1; p2.save()
-            send_message(p2.chat_id,
-                f"🎉 *بردید!*\n\n{board_visual}\n\n🏆 برنده: *{_fmt(prize)}*", p2_mk)
-            p1.losses += 1; p1.total_games += 1; p1.save()
-            send_message(p1.chat_id,
-                f"💀 *باختید!*\n\n{board_visual}", p1_mk)
-
-    p1.status = 'idle'; p1.save(update_fields=['status'])
-    if p2: p2.status = 'idle'; p2.save(update_fields=['status'])
-    match.status = 'finished'; match.finished_at = timezone.now(); match.save()
-
-
-def _send_c4f_board(match: GameMatch):
-    """Update both players with current board state."""
-    p1 = match.player1
-    p2 = match.player2
-    board = match.c4f_board
-
-    kb = c4f_board_kb(board, match.pk)
-
-    if match.c4f_turn == 1:
-        send_message(p1.chat_id, "✅ *نوبت شماست!* 🔴 یک ستون انتخاب کنید:", kb)
-        if p2:
-            send_message(p2.chat_id, "⏳ نوبت حریف است... 🟡", kb)
-    else:
-        if p2:
-            send_message(p2.chat_id, "✅ *نوبت شماست!* 🟡 یک ستون انتخاب کنید:", kb)
-        send_message(p1.chat_id, "⏳ نوبت حریف است... 🔴", kb)
-
-
-def _c4f_visual(board: str) -> str:
-    """Render the 6×7 board as emoji text for result messages."""
-    cell = {'.': '⬜', 'R': '🔴', 'Y': '🟡'}
-    col_nums = "1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣"
-    rows = [col_nums]
-    for row in range(5, -1, -1):  # top to bottom
-        rows.append(''.join(cell[board[row * 7 + col]] for col in range(7)))
-    return '\n'.join(rows)
 
 
 # ─── Leaderboard ──────────────────────────────────────────────────────────────
@@ -1554,27 +1745,35 @@ def _show_leaderboard(chat_id, mk):
 # ─── Help ─────────────────────────────────────────────────────────────────────
 
 def _show_help(chat_id, mk):
+    level_lines = "\n".join(
+        f"• {LEVELS[l]['label']}: ورود {_fmt(LEVELS[l]['entry'])} ← جایزه برنده {_fmt(LEVELS[l]['prize'])}"
+        for l in LEVEL_ORDER
+    )
     send_message(
         chat_id,
         "❓ *راهنمای ربات*\n\n"
         "🎮 *بازی‌ها:*\n"
-        "• *دوز (TTT)*: هزینه جستجو $0.30، شرط: $0.50–$2\n"
-        "• *سنگ کاغذ قیچی*: هزینه جستجو $0.20، شرط: $0.30–$5\n"
-        "• *چهار در یک*: هزینه جستجو $0.30، شرط: $0.50–$5\n"
-        "• *آفلاین (با ربات)*: هزینه $0.05، جایزه برد $0.35\n\n"
-        "🔴 *چهار در یک:*\n"
-        "تخته ۶×۷ است. مهره بیندازید (⬇️ ستون).\n"
-        "اولین کسی که ۴ مهره پشت سر هم (افقی، عمودی یا مورب) بچیند می‌برد!\n\n"
+        "• *سنگ کاغذ قیچی*: سه دور، اولین کسی که ۲ دور را ببرد برنده است.\n"
+        "• *دوز*: روی جدول ۳ در ۳ کلاسیک.\n"
+        "• *چهار در یک*: ۴ مهره پشت‌سرهم روی تخته ۶×۷.\n"
+        "• *ماین‌یاب*: بازی تک‌نفره؛ خانه‌های امن را بدون برخورد به مین باز کنید.\n\n"
+        "برای هر بازی، ابتدا یکی از حالت‌های زیر را انتخاب می‌کنید:\n"
+        "🔎 جستجوی آنلاین (بازی با یک حریف تصادفی)\n"
+        "🤖 بازی با ربات\n"
+        "👥 بازی با دوستان\n\n"
+        "🎚 *سطوح بازی آنلاین و بازی با ربات* (هزینه ورود ثابت → جایزه ثابت برنده):\n"
+        f"{level_lines}\n\n"
+        "👥 *بازی با دوستان:*\n"
+        f"هزینه ورود هرکدام: *{_fmt(FRIENDLY_ENTRY_FEE)}* — جایزه برنده: *{_fmt(FRIENDLY_PRIZE)}*\n\n"
         "💰 *کیف پول:*\n"
         "• شارژ از طریق کارت یا کریپتو\n"
-        "• برداشت حداقل $15 به کیف پول ترون\n\n"
+        f"• برداشت حداقل *{_fmt(MIN_WITHDRAWAL)}* به کیف پول ترون\n\n"
         "👥 *دوستان:*\n"
-        "• هزینه ارسال درخواست دوستی: $0.10\n"
-        "• هزینه دعوت به بازی: $0.20\n\n"
+        "• ارسال درخواست دوستی کاملاً *رایگان* است.\n\n"
         "🔗 *دعوت:*\n"
         "• دعوت دوست + تکمیل پروفایل = $0.50 برای هر دو\n\n"
-        "⏱ *جستجو:*\n"
-        "• اگر در ۵ دقیقه حریف پیدا نشد، هزینه برگشت داده می‌شود.",
+        "⏱ *جستجوی آنلاین:*\n"
+        "• اگر در ۵ دقیقه حریف پیدا نشد، هزینه ورود بازگردانده می‌شود.",
         mk,
     )
 
@@ -1595,7 +1794,7 @@ def _admin_panel(chat_id, user, mk):
         f"💸 برداشت در انتظار: *{pending_w}*\n"
         f"💳 واریز کارتی در انتظار: *{pending_d}*\n"
         f"🪙 واریز کریپتو در انتظار: *{pending_c}*\n\n"
-        "برای ارسال پیام همگانی، پیام خود را تایپ کنید:",
+        "برای ارسال پیام همگانی، پیام خود را تایپ کنید (یا «🔙 بازگشت» برای انصراف):",
         mk,
     )
     user.status = 'wait_broadcast'
@@ -1606,15 +1805,19 @@ def _handle_broadcast(chat_id, user, text, mk):
     if text in ("🔙 بازگشت", "/start"):
         _reset_user(user)
         return send_message(chat_id, "❌ ارسال لغو شد.", mk)
-    all_users = BotUser.objects.filter(is_banned=False)
-    total = all_users.count()
-    send_message(chat_id, f"⏳ در حال ارسال به {total} کاربر...")
-    success = fail = 0
-    for u in all_users:
-        try:
-            send_message(u.chat_id, text)
-            success += 1
-        except Exception:
-            fail += 1
+
     _reset_user(user)
-    send_message(chat_id, f"✅ پایان\n✔️ موفق: {success}\n❌ ناموفق: {fail}", mk)
+
+    job = BroadcastJob.objects.create(admin_chat_id=chat_id, text=text)
+
+    result = send_message_direct(
+        chat_id,
+        "⏳ *در حال ارسال پیام همگانی...*\n\nدر هر لحظه می‌توانید ارسال را لغو کنید.",
+        broadcast_cancel_kb(job.pk),
+    )
+    if result and result.get('ok'):
+        job.status_msg_id = result['result']['message_id']
+        job.save(update_fields=['status_msg_id'])
+
+    from rps.tasks import broadcast_task
+    broadcast_task.delay(job.pk)

@@ -11,7 +11,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot")
 def main_menu(is_admin=False):
     rows = [
         [{"text": "🎯 دوز (Tic-Tac-Toe)"}, {"text": "✊ سنگ کاغذ قیچی"}],
-        [{"text": "🔴 چهار در یک (Connect Four)"}],
+        [{"text": "🔴 چهار در یک (Connect Four)"}, {"text": "💣 ماین‌یاب"}],
         [{"text": "⚔️ بازی جنگ (به زودی)"}],
         [{"text": "👤 پروفایل من"}, {"text": "👥 دوستان"}],
         [{"text": "💰 کیف پول"}],
@@ -32,25 +32,52 @@ def back_kb():
 def cancel_search_kb():
     return {
         "keyboard": [
-            [{"text": "🤖 بازی آفلاین (با ربات)"}],
             [{"text": "❌ انصراف از جستجو"}],
         ],
         "resize_keyboard": True,
     }
 
 
-# RPS game keyboards
+# ─── Game mode selection (search online / play with bot / play with friends) ──
 
-def rps_bet_kb(game='rps'):
-    if game == 'rps':
-        bets = ["0.30$", "0.50$", "1.00$", "2.00$", "5.00$"]
-    elif game == 'ttt':
-        bets = ["0.50$", "0.70$", "1.00$", "1.50$", "2.00$"]
-    else:  # c4f
-        bets = ["0.50$", "1.00$", "2.00$", "3.00$", "5.00$"]
-    rows = [[{"text": f"💰 {b}"}] for b in bets]
+def game_mode_kb():
+    """Shown right after a game's description. No search/bot mode makes sense
+    for a solo game (Minesweeper) — that one skips straight to level_kb()."""
+    return {
+        "keyboard": [
+            [{"text": "🔎 جستجوی آنلاین"}],
+            [{"text": "🤖 بازی با ربات"}],
+            [{"text": "👥 بازی با دوستان"}],
+            [{"text": "🔙 بازگشت"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+# ─── Level selection (fixed entry fee → fixed prize, no open wagering) ────────
+
+LEVEL_BUTTON_LABELS = {
+    'intermediate': "🟢 متوسط  |  ورودی $0.30 → جایزه $0.50",
+    'master':       "🟠 حرفه‌ای  |  ورودی $0.60 → جایزه $1.00",
+    'gods':         "🔴 خدایان  |  ورودی $1.00 → جایزه $1.80",
+}
+
+
+def level_kb():
+    rows = [[{"text": LEVEL_BUTTON_LABELS[lvl]}] for lvl in ('intermediate', 'master', 'gods')]
     rows.append([{"text": "🔙 بازگشت"}])
     return {"keyboard": rows, "resize_keyboard": True}
+
+
+def rps_move_kb():
+    return {
+        "keyboard": [[
+            {"text": "🪨 سنگ"},
+            {"text": "📄 کاغذ"},
+            {"text": "✂️ قیچی"},
+        ]],
+        "resize_keyboard": True,
+    }
 
 
 def c4f_board_kb(board: str, match_id: int):
@@ -87,22 +114,11 @@ def c4f_board_kb(board: str, match_id: int):
     return {"inline_keyboard": rows}
 
 
-def rps_move_kb():
-    return {
-        "keyboard": [[
-            {"text": "🪨 سنگ"},
-            {"text": "📄 کاغذ"},
-            {"text": "✂️ قیچی"},
-        ]],
-        "resize_keyboard": True,
-    }
-
-
 # Tic-Tac-Toe inline keyboard from board state
 
 def ttt_board_kb(board: str, match_id: int):
     """
-    Board: 9-char string ('.' / 'X' / 'O').
+    Board: 9-char string ('.' / 'X' / 'O'). Always the classic 3×3 grid.
     Returns an inline_keyboard with 3×3 grid.
     """
     emojis = {'.': '⬜', 'X': '❌', 'O': '⭕'}
@@ -120,21 +136,66 @@ def ttt_board_kb(board: str, match_id: int):
     return {"inline_keyboard": rows}
 
 
-# Profile keyboards
+# ─── Minesweeper inline keyboard (5×6 solo board) ──────────────────────────────
+
+def ms_board_kb(board: str, revealed: str, match_id: int, rows=5, cols=6):
+    """
+    board:    30-char '*' (mine) / '0'-'8' (safe, neighbour-mine count)
+    revealed: 30-char '0' hidden / '1' revealed
+    """
+    number_emoji = {
+        '0': '▪️', '1': '1️⃣', '2': '2️⃣', '3': '3️⃣', '4': '4️⃣',
+        '5': '5️⃣', '6': '6️⃣', '7': '7️⃣', '8': '8️⃣',
+    }
+    kb_rows = []
+    for r in range(rows):
+        row_buttons = []
+        for c in range(cols):
+            idx = r * cols + c
+            if revealed[idx] == '1':
+                cell = board[idx]
+                text = "💥" if cell == '*' else number_emoji.get(cell, '▪️')
+            else:
+                text = "⬜"
+            row_buttons.append({"text": text, "callback_data": f"ms_{match_id}_{idx}"})
+        kb_rows.append(row_buttons)
+    return {"inline_keyboard": kb_rows}
+
+
+# ─── Profile keyboards ─────────────────────────────────────────────────────────
 
 def profile_menu_kb():
     return {
         "keyboard": [
             [{"text": "✏️ ویرایش نام"}, {"text": "✏️ ویرایش سن"}],
-            [{"text": "📱 ویرایش شماره"}, {"text": "💳 ویرایش کیف پول ترون"}],
-            [{"text": "🖼 تغییر آواتار"}, {"text": "🔗 لینک دعوت"}],
+            [{"text": "📱 ویرایش شماره"}, {"text": "🏙 ویرایش استان"}],
+            [{"text": "💳 ویرایش کیف پول ترون"}, {"text": "🖼 تغییر آواتار"}],
+            [{"text": "🔗 لینک دعوت"}],
             [{"text": "🔙 بازگشت"}],
         ],
         "resize_keyboard": True,
     }
 
 
-# Wallet keyboards
+def province_kb(provinces):
+    """provinces: iterable of Province objects with a usable .name"""
+    rows = []
+    row = []
+    for p in provinces:
+        name = p.name or f"استان #{p.pk}"
+        row.append({"text": name})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if not rows:
+        rows.append([{"text": "— هنوز استانی ثبت نشده —"}])
+    rows.append([{"text": "🔙 بازگشت"}])
+    return {"keyboard": rows, "resize_keyboard": True}
+
+
+# ─── Wallet keyboards ───────────────────────────────────────────────────────────
 
 def wallet_menu_kb():
     return {
@@ -174,7 +235,7 @@ def crypto_proof_kb():
     }
 
 
-# Friends keyboards
+# ─── Friends keyboards ──────────────────────────────────────────────────────────
 
 def friends_menu_kb():
     return {
@@ -188,7 +249,16 @@ def friends_menu_kb():
     }
 
 
-# Admin keyboards
+def friend_pick_kb(friends):
+    rows = []
+    for f in friends[:20]:
+        name = f.full_name or f.username or str(f.chat_id)
+        rows.append([{"text": f"{name} ({f.chat_id})"}])
+    rows.append([{"text": "🔙 بازگشت"}])
+    return {"keyboard": rows, "resize_keyboard": True}
+
+
+# ─── Admin keyboards ─────────────────────────────────────────────────────────────
 
 def admin_report_inline_kb(report_id: int):
     return {
@@ -214,6 +284,14 @@ def admin_deposit_inline_kb(req_id: int, crypto=False):
         "inline_keyboard": [[
             {"text": "✅ تایید",  "callback_data": f"{prefix}_verify_{req_id}"},
             {"text": "❌ رد",     "callback_data": f"{prefix}_reject_{req_id}"},
+        ]]
+    }
+
+
+def broadcast_cancel_kb(job_id: int):
+    return {
+        "inline_keyboard": [[
+            {"text": "❌ لغو ارسال همگانی", "callback_data": f"bcast_cancel_{job_id}"},
         ]]
     }
 

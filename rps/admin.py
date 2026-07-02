@@ -1,16 +1,27 @@
 from django.contrib import admin
 from django.utils.safestring import mark_safe
 from .models import (
-    BotUser, GameMatch, FriendRequest, Friendship,
+    BotUser, Province, GameMatch, FriendRequest, Friendship,
     WithdrawalRequest, DepositRequest, CryptoDepositRequest, Report,
+    BroadcastJob,
 )
+
+
+@admin.register(Province)
+class ProvinceAdmin(admin.ModelAdmin):
+    # Every field on the model is optional (null=True, blank=True) so you can
+    # fill this in gradually from the admin panel without hitting validation errors.
+    list_display = ('id', 'name', 'code', 'is_active', 'order', 'created_at')
+    list_editable = ('is_active', 'order')
+    search_fields = ('name', 'code')
+    list_filter = ('is_active',)
 
 
 @admin.register(BotUser)
 class BotUserAdmin(admin.ModelAdmin):
-    list_display = ('chat_id', 'full_name', 'username', 'age', 'balance_display', 'wins', 'losses', 'is_banned', 'created_at')
-    search_fields = ('chat_id', 'username', 'full_name', 'tron_wallet')
-    list_filter = ('is_banned', 'profile_complete')
+    list_display = ('chat_id', 'full_name', 'username', 'age', 'province', 'balance_display', 'wins', 'losses', 'is_banned', 'created_at')
+    search_fields = ('chat_id', 'username', 'full_name', 'phone', 'tron_wallet')
+    list_filter = ('is_banned', 'profile_complete', 'province')
     readonly_fields = ('created_at',)
 
     def balance_display(self, obj):
@@ -20,12 +31,16 @@ class BotUserAdmin(admin.ModelAdmin):
 
 @admin.register(GameMatch)
 class GameMatchAdmin(admin.ModelAdmin):
-    list_display = ('id', 'game_type', 'player1', 'player2', 'bet_display', 'status', 'is_offline', 'created_at')
-    list_filter = ('game_type', 'status', 'is_offline')
+    list_display = ('id', 'game_type', 'mode', 'level', 'player1', 'player2', 'entry_fee_display', 'prize_display', 'status', 'is_offline', 'created_at')
+    list_filter = ('game_type', 'mode', 'level', 'status', 'is_offline')
 
-    def bet_display(self, obj):
-        return f"${obj.bet_cents/100:.2f}"
-    bet_display.short_description = "شرط"
+    def entry_fee_display(self, obj):
+        return f"${obj.entry_fee_cents/100:.2f}"
+    entry_fee_display.short_description = "هزینه ورود"
+
+    def prize_display(self, obj):
+        return f"${obj.prize_cents/100:.2f}"
+    prize_display.short_description = "جایزه"
 
 
 @admin.register(FriendRequest)
@@ -121,3 +136,10 @@ class ReportAdmin(admin.ModelAdmin):
             rep.status = 'banned'
             rep.save()
     ban_reported.short_description = "مسدود کردن"
+
+
+@admin.register(BroadcastJob)
+class BroadcastJobAdmin(admin.ModelAdmin):
+    list_display = ('id', 'admin_chat_id', 'status', 'sent', 'failed', 'total', 'created_at')
+    list_filter = ('status',)
+    readonly_fields = ('admin_chat_id', 'text', 'total', 'sent', 'failed', 'status_msg_id', 'created_at')

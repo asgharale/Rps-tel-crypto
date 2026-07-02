@@ -2,19 +2,44 @@
 models.py  –  Full data model for the Telegram game bot.
 
 Tables:
-  BotUser               – registered users (name, age, phone, wallet, avatar)
+  BotUser               – registered users (name, age, phone, province, wallet, avatar)
+  Province              – admin-managed list of provinces (all fields optional)
   Friendship            – bi-directional friend links (pending / accepted)
-  FriendRequest         – one-directional incoming request (0.1$ fee)
-  GameMatch             – RPS & Tic-Tac-Toe matches (online & offline)
-  WithdrawalRequest     – withdrawal queue (min $15 / TRON wallet)
+  FriendRequest         – one-directional incoming request (free)
+  GameMatch             – RPS / Tic-Tac-Toe / Connect Four / Minesweeper matches
+  WithdrawalRequest     – withdrawal queue (min $10 / TRON wallet)
   DepositRequest        – card/receipt deposits
   CryptoDepositRequest  – crypto wallet deposits
   Report                – user reports (admin can ignore/ban)
+  BroadcastJob          – tracks an in-progress admin broadcast (supports cancel)
+
+Note on terminology: this bot does NOT use betting/gambling language anywhere.
+Every paid game has a fixed, published "entry fee" (هزینه ورود) and a fixed
+"prize" (جایزه) that the winner receives — there is no open-ended wagering.
 """
 
 from django.db import models
 from django.utils import timezone
 from django.utils.safestring import mark_safe
+
+
+# ─── Province (admin fills this in; every field is optional) ──────────────────
+
+class Province(models.Model):
+    name        = models.CharField(max_length=100, null=True, blank=True, verbose_name="نام استان")
+    code        = models.CharField(max_length=20, null=True, blank=True, verbose_name="کد استان")
+    description = models.TextField(null=True, blank=True, verbose_name="توضیحات")
+    is_active   = models.BooleanField(default=True, verbose_name="فعال")
+    order       = models.PositiveIntegerField(null=True, blank=True, verbose_name="ترتیب نمایش")
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order', 'name']
+        verbose_name = "استان"
+        verbose_name_plural = "استان‌ها"
+
+    def __str__(self):
+        return self.name or f"استان #{self.pk}"
 
 
 # ─── User ─────────────────────────────────────────────────────────────────────
@@ -25,6 +50,10 @@ class BotUser(models.Model):
     full_name  = models.CharField(max_length=255, null=True, blank=True, verbose_name="نام")
     age        = models.PositiveSmallIntegerField(null=True, blank=True, verbose_name="سن")
     phone      = models.CharField(max_length=20, null=True, blank=True, verbose_name="شماره تلفن")
+    province   = models.ForeignKey(
+        Province, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='users', verbose_name="استان",
+    )
     tron_wallet = models.CharField(max_length=100, null=True, blank=True, verbose_name="آدرس کیف پول ترون")
     avatar_file_id = models.CharField(max_length=255, null=True, blank=True, verbose_name="آواتار")
 
@@ -111,7 +140,7 @@ class BotUser(models.Model):
 # ─── Friendship ───────────────────────────────────────────────────────────────
 
 class FriendRequest(models.Model):
-    """One directional request. Fee of $0.10 deducted on send."""
+    """One directional friend request. Completely free to send."""
     STATUS_CHOICES = [
         ('pending',  'در انتظار'),
         ('accepted', 'پذیرفته شده'),
@@ -120,7 +149,6 @@ class FriendRequest(models.Model):
     sender   = models.ForeignKey(BotUser, on_delete=models.CASCADE, related_name='sent_requests')
     receiver = models.ForeignKey(BotUser, on_delete=models.CASCADE, related_name='received_requests')
     status   = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
-    fee_paid = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -165,6 +193,7 @@ class GameMatch(models.Model):
         ('rps', 'سنگ کاغذ قیچی'),
         ('ttt', 'دوز'),
         ('c4f', 'چهار در یک'),
+        ('ms',  'ماین‌یاب'),
     ]
     STATUS_CHOICES = [
         ('searching', 'جستجو'),
@@ -172,19 +201,37 @@ class GameMatch(models.Model):
         ('finished',  'پایان یافته'),
         ('cancelled', 'لغو شده'),
     ]
+    LEVEL_CHOICES = [
+        ('intermediate', 'متوسط'),
+        ('master',       'حرفه‌ای'),
+        ('gods',         'خدایان'),
+        ('friendly',     'دوستانه'),
+    ]
+    MODE_CHOICES = [
+        ('online',   'جستجوی آنلاین'),
+        ('bot',      'بازی با ربات'),
+        ('friendly', 'بازی با دوستان'),
+        ('solo',     'تکی'),
+    ]
 
     game_type  = models.CharField(max_length=5, choices=GAME_CHOICES, default='rps')
+    mode       = models.CharField(max_length=10, choices=MODE_CHOICES, default='online')
+    level      = models.CharField(max_length=15, choices=LEVEL_CHOICES, default='intermediate')
+
     player1    = models.ForeignKey(BotUser, on_delete=models.CASCADE, related_name='matches_as_p1')
     player2    = models.ForeignKey(BotUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='matches_as_p2')
     is_offline = models.BooleanField(default=False)   # vs bot
 
-    # Bet in cents ($0 for offline)
-    bet_cents        = models.IntegerField(default=0)
-    search_fee_cents = models.IntegerField(default=0)  # fee paid to search
+    # Fixed entry fee + fixed prize for the winner (in cents). No open wagering.
+    entry_fee_cents = models.IntegerField(default=0, verbose_name="هزینه ورود (سنت)")
+    prize_cents     = models.IntegerField(default=0, verbose_name="جایزه برنده (سنت)")
 
-    # RPS moves
-    p1_move = models.CharField(max_length=20, null=True, blank=True)
-    p2_move = models.CharField(max_length=20, null=True, blank=True)
+    # RPS: best of 3 rounds — first to 2 round-wins takes the match
+    p1_move  = models.CharField(max_length=20, null=True, blank=True)
+    p2_move  = models.CharField(max_length=20, null=True, blank=True)
+    rps_round   = models.SmallIntegerField(default=1)
+    rps_p1_wins = models.SmallIntegerField(default=0)
+    rps_p2_wins = models.SmallIntegerField(default=0)
 
     # Tic-Tac-Toe board: 9-char string, '.' = empty, 'X' = p1, 'O' = p2
     ttt_board  = models.CharField(max_length=9, default='.' * 9)
@@ -196,19 +243,39 @@ class GameMatch(models.Model):
     c4f_board  = models.CharField(max_length=42, default='.' * 42)
     c4f_turn   = models.SmallIntegerField(default=1)   # 1 = p1, 2 = p2
 
+    # Minesweeper: 5×6 = 30-cell solo board.
+    # ms_board:    '*' = mine, '0'-'8' = safe cell with neighbour-mine count
+    # ms_revealed: '0' = hidden, '1' = revealed
+    ms_board    = models.CharField(max_length=30, default='.' * 30)
+    ms_revealed = models.CharField(max_length=30, default='0' * 30)
+    ms_mines    = models.SmallIntegerField(default=6)
+
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='searching')
+
+    # Message ids so turns can be updated in-place with editMessageText
+    # instead of sending a brand-new message every turn.
+    p1_search_msg_id = models.BigIntegerField(null=True, blank=True)
+    p1_msg_id = models.BigIntegerField(null=True, blank=True)
+    p2_msg_id = models.BigIntegerField(null=True, blank=True)
 
     # For search animation tracking
     search_started_at = models.DateTimeField(null=True, blank=True)
-
-    # Message IDs for editing the search animation message
-    p1_search_msg_id = models.BigIntegerField(null=True, blank=True)
 
     created_at  = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"Match#{self.pk} {self.game_type} {self.status}"
+
+    # ── RPS helpers ─────────────────────────────────────────────────────────
+
+    def rps_round_winner(self):
+        """Returns 'p1', 'p2', or 'draw' for the current round's two moves."""
+        wins_over = {"🪨 سنگ": "✂️ قیچی", "📄 کاغذ": "🪨 سنگ", "✂️ قیچی": "📄 کاغذ"}
+        m1, m2 = self.p1_move, self.p2_move
+        if m1 == m2:
+            return 'draw'
+        return 'p1' if wins_over[m1] == m2 else 'p2'
 
     # ── TTT helpers ───────────────────────────────────────────────────────────
 
@@ -295,9 +362,6 @@ class GameMatch(models.Model):
         """
         board = list(self.c4f_board)
 
-        def can_drop(b, col):
-            return b[col] == '.'      # top cell empty = column not full (row 5)
-
         def drop_sim(b, col, sym):
             nb = b[:]
             for row in range(6):
@@ -338,8 +402,14 @@ class GameMatch(models.Model):
         return valid[0]
 
     def ttt_bot_move(self):
-        """Simple minimax bot move. Returns chosen position."""
+        """Simple minimax bot move (always the 3×3 board). Returns chosen position."""
         board = list(self.ttt_board)
+
+        def _ttt_check(b):
+            wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+            for a,c,d in wins:
+                if b[a]==b[c]==b[d] != '.': return b[a]
+            return None
 
         def minimax(b, is_max):
             w = _ttt_check(b)
@@ -363,12 +433,6 @@ class GameMatch(models.Model):
                         b[i] = '.'
                 return best
 
-        def _ttt_check(b):
-            wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
-            for a,c,d in wins:
-                if b[a]==b[c]==b[d] != '.': return b[a]
-            return None
-
         best_val, best_move = -100, -1
         for i in range(9):
             if board[i] == '.':
@@ -378,6 +442,83 @@ class GameMatch(models.Model):
                 if val > best_val:
                     best_val, best_move = val, i
         return best_move
+
+    # ── Minesweeper helpers (solo, 5 rows × 6 cols = 30 cells) ────────────────
+
+    MS_ROWS = 5
+    MS_COLS = 6
+
+    def ms_generate(self, mines: int = 6, safe_index: int | None = None):
+        """Generate a fresh mine layout, guaranteeing `safe_index` is not a mine."""
+        import random as _r
+        total = self.MS_ROWS * self.MS_COLS
+        cells = list(range(total))
+        if safe_index is not None and safe_index in cells:
+            cells.remove(safe_index)
+        mine_positions = set(_r.sample(cells, min(mines, len(cells))))
+
+        board = []
+        for i in range(total):
+            if i in mine_positions:
+                board.append('*')
+                continue
+            r, c = divmod(i, self.MS_COLS)
+            count = 0
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < self.MS_ROWS and 0 <= nc < self.MS_COLS:
+                        if nr * self.MS_COLS + nc in mine_positions:
+                            count += 1
+            board.append(str(count))
+        self.ms_board = ''.join(board)
+        self.ms_revealed = '0' * total
+        self.ms_mines = mines
+
+    def ms_reveal(self, index: int) -> str:
+        """
+        Reveal a cell (with flood-fill for 0-count cells).
+        Returns 'mine', 'already', or 'ok'.
+        """
+        revealed = list(self.ms_revealed)
+        if revealed[index] == '1':
+            return 'already'
+        if self.ms_board[index] == '*':
+            revealed[index] = '1'
+            self.ms_revealed = ''.join(revealed)
+            return 'mine'
+
+        # Flood-fill from this cell across connected zero-count cells.
+        stack = [index]
+        seen = set()
+        while stack:
+            idx = stack.pop()
+            if idx in seen or revealed[idx] == '1':
+                continue
+            seen.add(idx)
+            revealed[idx] = '1'
+            if self.ms_board[idx] == '0':
+                r, c = divmod(idx, self.MS_COLS)
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < self.MS_ROWS and 0 <= nc < self.MS_COLS:
+                            nidx = nr * self.MS_COLS + nc
+                            if self.ms_board[nidx] != '*' and revealed[nidx] == '0':
+                                stack.append(nidx)
+        self.ms_revealed = ''.join(revealed)
+        return 'ok'
+
+    def ms_is_won(self) -> bool:
+        """Won once every non-mine cell has been revealed."""
+        for i, cell in enumerate(self.ms_board):
+            if cell != '*' and self.ms_revealed[i] == '0':
+                return False
+        return True
 
 
 # ─── Wallet / Deposits / Withdrawals ─────────────────────────────────────────
@@ -548,3 +689,24 @@ class Report(models.Model):
 
     def __str__(self):
         return f"Report#{self.pk}: {self.reporter} → {self.reported} [{self.status}]"
+
+
+# ─── Broadcast (admin "message everyone", cancellable) ────────────────────────
+
+class BroadcastJob(models.Model):
+    STATUS_CHOICES = [
+        ('running',   'در حال ارسال'),
+        ('cancelled', 'لغو شده'),
+        ('done',      'پایان یافته'),
+    ]
+    admin_chat_id = models.BigIntegerField()
+    text          = models.TextField()
+    status        = models.CharField(max_length=10, choices=STATUS_CHOICES, default='running')
+    total         = models.IntegerField(default=0)
+    sent          = models.IntegerField(default=0)
+    failed        = models.IntegerField(default=0)
+    status_msg_id = models.BigIntegerField(null=True, blank=True)
+    created_at    = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Broadcast#{self.pk} [{self.status}] {self.sent}/{self.total}"

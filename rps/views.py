@@ -62,6 +62,14 @@ def handle_callback(callback: dict) -> HttpResponse:
     if data.startswith("ttt_"):
         return _handle_ttt_callback(cb_id, from_id, data)
 
+    # ── Minesweeper reveal ────────────────────────────────────────────────────
+    if data.startswith("ms_"):
+        return _handle_ms_callback(cb_id, from_id, data)
+
+    # ── Broadcast cancel ──────────────────────────────────────────────────────
+    if data.startswith("bcast_cancel_"):
+        return _handle_broadcast_cancel(cb_id, from_id, data)
+
     # ── Crypto deposit admin ───────────────────────────────────────────────────
     if data.startswith("crypto_verify_") or data.startswith("crypto_reject_"):
         return _handle_crypto_admin(cb_id, from_id, chat_id, msg_id, message, data)
@@ -170,6 +178,71 @@ def _handle_ttt_callback(cb_id, from_id, data):
     else:
         answer_callback_direct(cb_id, "✅")
 
+    return HttpResponse(status=200)
+
+
+# ── Minesweeper callback ──────────────────────────────────────────────────────
+
+def _handle_ms_callback(cb_id, from_id, data):
+    from rps.models import GameMatch, BotUser
+    from rps.logic import handle_ms_move
+
+    parts = data.split("_")
+    # format: ms_{match_id}_{index}
+    if len(parts) != 3:
+        answer_callback_direct(cb_id, "خطا", show_alert=True)
+        return HttpResponse(status=200)
+
+    match_id = int(parts[1])
+    index = int(parts[2])
+
+    try:
+        match = GameMatch.objects.select_related('player1').get(pk=match_id)
+        player = BotUser.objects.get(chat_id=from_id)
+    except (GameMatch.DoesNotExist, BotUser.DoesNotExist):
+        answer_callback_direct(cb_id, "❌ بازی یافت نشد.", show_alert=True)
+        return HttpResponse(status=200)
+
+    result = handle_ms_move(match, player, index)
+
+    if result == 'mine':
+        answer_callback_direct(cb_id, "💥 به مین خوردید!", show_alert=True)
+    elif result == 'win':
+        answer_callback_direct(cb_id, "🎉 بردید!", show_alert=True)
+    elif result == 'already':
+        answer_callback_direct(cb_id, "این خانه قبلاً باز شده.", show_alert=False)
+    elif result == 'already_done':
+        answer_callback_direct(cb_id, "✅ بازی تمام شده است.", show_alert=False)
+    elif result == 'invalid':
+        answer_callback_direct(cb_id, "⚠️ این بازی شما نیست.", show_alert=True)
+    else:
+        answer_callback_direct(cb_id, "✅")
+
+    return HttpResponse(status=200)
+
+
+# ── Broadcast cancel callback ─────────────────────────────────────────────────
+
+def _handle_broadcast_cancel(cb_id, from_id, data):
+    if not _require_admin(cb_id, from_id):
+        return HttpResponse(status=200)
+
+    from rps.models import BroadcastJob
+    job_id = int(data.split("_")[-1])
+
+    try:
+        job = BroadcastJob.objects.get(pk=job_id)
+    except BroadcastJob.DoesNotExist:
+        answer_callback_direct(cb_id, "❌ یافت نشد.", show_alert=True)
+        return HttpResponse(status=200)
+
+    if job.status != 'running':
+        answer_callback_direct(cb_id, f"این ارسال قبلاً {job.status} شده.", show_alert=True)
+        return HttpResponse(status=200)
+
+    job.status = 'cancelled'
+    job.save(update_fields=['status'])
+    answer_callback_direct(cb_id, "⛔️ درخواست لغو ثبت شد.", show_alert=True)
     return HttpResponse(status=200)
 
 
@@ -347,7 +420,7 @@ def _handle_friend_request(cb_id, from_id, data):
     return HttpResponse(status=200)
 
 
-# ── Game invite callback ───────────────────────────────────────────────────────
+# ── Game invite callback (friendly game, flat $0.10 entry each) ───────────────
 
 def _handle_game_invite(cb_id, from_id, data):
     from rps.models import GameMatch, BotUser
@@ -366,26 +439,30 @@ def _handle_game_invite(cb_id, from_id, data):
         answer_callback_direct(cb_id, "⏰ این دعوتنامه منقضی شده.", show_alert=True)
         return HttpResponse(status=200)
 
-    from rps.logic import _join_match, _is_admin
-    mk = main_menu(_is_admin(invitee.chat_id))
+    from rps.logic import _join_match
 
     if action == "accept":
-        # Deduct search fee + bet from invitee
-        fees = {'rps': 20, 'ttt': 30, 'c4f': 30}  # cents
-        fee = fees.get(match.game_type, 20)
-        total = fee + match.bet_cents
-        if invitee.balance_cents < total:
-            answer_callback_direct(cb_id, f"❌ موجودی کافی ندارید ({_fmt(total)} لازم است).", show_alert=True)
+        # The entry fee + prize were already fixed when the invite was created.
+        fee = match.entry_fee_cents
+        if invitee.balance_cents < fee:
+            answer_callback_direct(cb_id, f"❌ موجودی کافی ندارید ({_fmt(fee)} لازم است).", show_alert=True)
             return HttpResponse(status=200)
-        invitee.balance_cents -= total
+        invitee.balance_cents -= fee
         invitee.save(update_fields=['balance_cents'])
-        _join_match(match, invitee, match.game_type, match.bet_cents, mk)
+        _join_match(match, invitee)
         answer_callback_direct(cb_id, "✅ بازی شروع شد!")
     else:
+        match.status = 'cancelled'
+        match.save(update_fields=['status'])
+        # Refund the inviter's entry fee since the invite was declined.
+        inviter = match.player1
+        if match.entry_fee_cents > 0:
+            inviter.balance_cents += match.entry_fee_cents
+            inviter.save(update_fields=['balance_cents'])
         answer_callback_direct(cb_id, "❌ دعوت رد شد.")
         send_message_direct(
-            match.player1.chat_id,
-            "😔 دوستتان دعوت بازی شما را رد کرد."
+            inviter.chat_id,
+            "😔 دوستتان دعوت بازی شما را رد کرد. هزینه ورود به کیف پول شما بازگشت."
         )
 
     return HttpResponse(status=200)

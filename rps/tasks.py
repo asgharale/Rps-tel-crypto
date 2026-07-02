@@ -5,10 +5,10 @@ Tasks:
   send_message_task          – queue a bot message (retry-safe)
   edit_message_task          – edit an already-sent message
   search_animation_task      – animated "searching for opponent" updater
-  expire_search_task         – refund fee if no opponent found in 5 min
+  expire_search_task         – refund entry fee if no opponent found in 5 min
+  broadcast_task              – admin "message everyone", checks for cancellation
 """
 
-import random
 from celery import shared_task
 from rps.tg_api import send_message_direct, edit_message_direct, answer_callback_direct
 
@@ -91,14 +91,14 @@ def search_animation_task(match_id: int, tick: int = 0):
     secs = elapsed_secs % 60
     time_str = f"{mins}:{secs:02d}"
 
-    names = {'rps': 'سنگ کاغذ قیچی', 'ttt': 'دوز', 'c4f': 'چهار در یک'}
+    names = {'rps': 'سنگ کاغذ قیچی', 'ttt': 'دوز', 'c4f': 'چهار در یک', 'ms': 'ماین‌یاب'}
     game_name = names.get(match.game_type, match.game_type)
-    bet_str = f"${match.bet_cents/100:.2f}" if match.bet_cents else "آفلاین"
 
     text = (
         f"{frame}\n\n"
         f"🎮 بازی: *{game_name}*\n"
-        f"💰 شرط: *{bet_str}*\n"
+        f"💵 هزینه ورود: *${match.entry_fee_cents/100:.2f}*\n"
+        f"🏆 جایزه برنده: *${match.prize_cents/100:.2f}*\n"
         f"⏱ زمان جستجو: `{time_str}`\n\n"
         f"{tip}\n\n"
         f"_در حال بررسی بازیکنان آنلاین..._"
@@ -126,7 +126,7 @@ def search_animation_task(match_id: int, tick: int = 0):
 def expire_search_task(match_id: int):
     """
     Called after 5 minutes (300 seconds) to expire a search.
-    Refunds the search fee and sends a friendly sorry message.
+    Refunds the entry fee and sends a friendly sorry message.
     """
     from rps.models import GameMatch
     from rps.tg_api import send_message_direct
@@ -140,10 +140,10 @@ def expire_search_task(match_id: int):
     if match.status != 'searching':
         return  # Already matched or cancelled
 
-    # Refund search fee
+    # Refund entry fee
     player = match.player1
-    if match.search_fee_cents > 0:
-        player.balance_cents += match.search_fee_cents
+    if match.entry_fee_cents > 0:
+        player.balance_cents += match.entry_fee_cents
         player.save(update_fields=['balance_cents'])
 
     match.status = 'cancelled'
@@ -155,8 +155,8 @@ def expire_search_task(match_id: int):
     send_message_direct(
         player.chat_id,
         "😔 *متأسفانه حریفی یافت نشد!*\n\n"
-        "⏱ بعد از ۵ دقیقه جستجو، هزینه جستجو به کیف پول شما بازگشت.\n"
-        "🔄 می‌توانید دوباره تلاش کنید یا یک بازی آفلاین شروع کنید.",
+        "⏱ بعد از ۵ دقیقه جستجو، هزینه ورود به کیف پول شما بازگشت.\n"
+        "🔄 می‌توانید دوباره تلاش کنید یا یک بازی با ربات شروع کنید.",
         main_menu(is_admin),
     )
 
@@ -164,4 +164,62 @@ def expire_search_task(match_id: int):
 def _is_admin(chat_id):
     import os
     admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-    return chat_id in admin_idsSS
+    return chat_id in admin_ids
+
+
+# ─── Broadcast ("message everyone", cancellable) ───────────────────────────────
+
+@shared_task
+def broadcast_task(job_id: int):
+    """
+    Sends job.text to every non-banned user, in small batches, re-checking
+    after every batch whether the admin pressed "❌ لغو ارسال همگانی".
+    """
+    from rps.models import BotUser, BroadcastJob
+    from rps.tg_api import send_message_direct
+
+    try:
+        job = BroadcastJob.objects.get(pk=job_id)
+    except BroadcastJob.DoesNotExist:
+        return
+
+    user_ids = list(BotUser.objects.filter(is_banned=False).values_list('chat_id', flat=True))
+    job.total = len(user_ids)
+    job.save(update_fields=['total'])
+
+    BATCH = 20
+    for i in range(0, len(user_ids), BATCH):
+        # Re-fetch so we see a cancellation made mid-flight from the callback handler.
+        job.refresh_from_db(fields=['status'])
+        if job.status == 'cancelled':
+            break
+
+        for chat_id in user_ids[i:i + BATCH]:
+            try:
+                result = send_message_direct(chat_id, job.text)
+                if result and result.get('ok'):
+                    job.sent += 1
+                else:
+                    job.failed += 1
+            except Exception:
+                job.failed += 1
+        job.save(update_fields=['sent', 'failed'])
+
+    if job.status != 'cancelled':
+        job.status = 'done'
+        job.save(update_fields=['status'])
+
+    summary = (
+        f"✅ *ارسال همگانی پایان یافت*\n\n"
+        f"📨 موفق: *{job.sent}*\n"
+        f"❌ ناموفق: *{job.failed}*\n"
+        f"👥 مجموع: *{job.total}*"
+        if job.status == 'done' else
+        f"⛔️ *ارسال همگانی لغو شد*\n\n"
+        f"📨 قبل از لغو ارسال شد: *{job.sent}* از *{job.total}*"
+    )
+    if job.status_msg_id:
+        from rps.tg_api import edit_message_direct
+        edit_message_direct(job.admin_chat_id, job.status_msg_id, summary)
+    else:
+        send_message_direct(job.admin_chat_id, summary)
