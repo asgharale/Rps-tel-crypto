@@ -12,7 +12,6 @@ def main_menu(is_admin=False):
     rows = [
         [{"text": "🎯 دوز (Tic-Tac-Toe)"}, {"text": "✊ سنگ کاغذ قیچی"}],
         [{"text": "🔴 چهار در یک (Connect Four)"}, {"text": "💣 ماین‌یاب"}],
-        [{"text": "⚔️ بازی جنگ (به زودی)"}],
         [{"text": "👤 پروفایل من"}, {"text": "👥 دوستان"}],
         [{"text": "💰 کیف پول"}],
         [{"text": "🏆 رتبه‌بندی"}, {"text": "❓ راهنما"}],
@@ -217,7 +216,6 @@ def deposit_amount_kb():
 def deposit_method_kb():
     return {
         "keyboard": [
-            [{"text": "💳 پرداخت کارتی (رسید)"}],
             [{"text": "🪙 واریز کریپتو"}],
             [{"text": "🔙 بازگشت"}],
         ],
